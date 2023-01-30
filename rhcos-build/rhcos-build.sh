@@ -6,16 +6,40 @@
 PROG=$(basename "$0")
 SCRIPTDIR=$(dirname "$(readlink -f "$0")")
 
+#
+# Check required tools
+#
+REQUIRED_TOOLS=(
+    createrepo
+    curl
+    jq
+    oc
+    podman
+    repoquery
+    skopeo
+    wget
+)
+MISSING_TOOLS=()
+
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! command -v "${tool}" >/dev/null 2>&1; then
+        MISSING_TOOLS+=( "${tool}" )
+    fi
+done
+
+if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+    echo "The following required tools are missing:" >&2
+    echo "${MISSING_TOOLS[@]}" >&2
+    exit 1
+fi
+
 function usage {
     cat <<EOF
 Usage: ${PROG} ...
 Parameters:
-    --docker <repo>                 Repo for release image (docker.io)
-    --oc-auth <auth file>           Auth file for oc commands
-    --os-repo-auth <auth file>      Auth file for pushing machine-os-content image
-    --os-repo <repo>                Repo for custom machine-os-content image
+    --auth <auth file>              Auth file for oc commands and OPTV registry
+    --optv-registry <reg>           Registry for built images
     --pkg-dir <dir>                 Directory containing custom RPMs to override
-    --quay <repo>                   Repo for release image (quay.io)
     --suffix <name>                 Suffix for custom release version
     -z <z-stream>                   Baseline Z-stream (eg. 4.10.26)
 
@@ -80,18 +104,15 @@ function cosa {
 #
 # Process command-line args
 #
-if ! OPTS=$(getopt -o "h,z:" --long "help,docker:,oc-auth:,os-repo:,os-repo-auth:,pkg-dir:,quay:,suffix:,img-override:,add-kernel-rt-pkg:,add-pkg:" --name "$0" -- "$@"); then
+if ! OPTS=$(getopt -o "h,z:" --long "help,,auth:,optv-registry:,pkg-dir:,quay:,suffix:,img-override:,add-kernel-rt-pkg:,add-pkg:" --name "$0" -- "$@"); then
     usage
     exit 1
 fi
 
 eval set -- "${OPTS}"
 
-declare CUSTOM_OS_CONTENT_REPO=
-declare CUSTOM_REL_DOCKER_REPO=
-declare CUSTOM_REL_QUAY_REPO=
-declare OC_AUTH_FILE=${HOME}/.docker/config.json
-declare OS_REPO_AUTH_FILE=
+declare OPTV_REGISTRY=
+declare AUTH_FILE=${HOME}/.docker/config.json
 declare PKG_DIR=
 declare REL_Z=
 declare SUFFIX=
@@ -101,28 +122,16 @@ declare -a EXTRA_PKGS=()
 
 while :; do
     case "$1" in
-        --docker)
-            CUSTOM_REL_DOCKER_REPO="$2"
+        --auth)
+            AUTH_FILE="$2"
             shift 2
             ;;
-        --oc-auth)
-            OC_AUTH_FILE="$2"
-            shift 2
-            ;;
-        --os-repo)
-            CUSTOM_OS_CONTENT_REPO="$2"
-            shift 2
-            ;;
-        --os-repo-auth)
-            OS_REPO_AUTH_FILE="$2"
+        --optv-registry)
+            OPTV_REGISTRY="$2"
             shift 2
             ;;
         --pkg-dir)
             PKG_DIR="$2"
-            shift 2
-            ;;
-        --quay)
-            CUSTOM_REL_QUAY_REPO="$2"
             shift 2
             ;;
         --suffix)
@@ -158,11 +167,8 @@ while :; do
     esac
 done
 
-if [ -z "${CUSTOM_OS_CONTENT_REPO}" ] || \
-    [ -z "${CUSTOM_REL_DOCKER_REPO}" ] || \
-    [ -z "${CUSTOM_REL_QUAY_REPO}" ] || \
-    [ -z "${OC_AUTH_FILE}" ] || \
-    [ -z "${OS_REPO_AUTH_FILE}" ] || \
+if [ -z "${OPTV_REGISTRY}" ] || \
+    [ -z "${AUTH_FILE}" ] || \
     [ -z "${PKG_DIR}" ] || \
     [ -z "${REL_Z}" ] || \
     [ -z "${SUFFIX}" ]; then
@@ -198,34 +204,41 @@ shopt -u nullglob
 REL_Y=${REL_Z%\.*}
 export COREOS_ASSEMBLER_CONTAINER=quay.io/coreos-assembler/coreos-assembler:rhcos-${REL_Y}
 
-if [[ ! "${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS}" =~ "--env REGISTRY_AUTH_FILE=" ]]; then
-    export COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS="${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS} --env REGISTRY_AUTH_FILE=${OS_REPO_AUTH_FILE}"
+if [[ ! -f /dev/kvm && ! "${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS}" =~ "--env COSA_NO_KVM=1" ]]; then
+    log "No /dev/kvm found. Setting COSA_NO_KVM=1"
+    export COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS="${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS} --env COSA_NO_KVM=1"
 fi
 
+if [[ ! "${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS}" =~ "--env REGISTRY_AUTH_FILE=" ]]; then
+    export COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS="${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS} --env REGISTRY_AUTH_FILE=${AUTH_FILE}"
+fi
+
+# Bind-mount certs for cosa
+export COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS="${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS} -v /etc/pki/ca-trust:/etc/pki/ca-trust"
+
 CUSTOM_REL_NAME="${REL_Z}-${SUFFIX}.$(date -u +%Y%m%d%H%M)"
-CUSTOM_REL_DOCKER=${CUSTOM_REL_DOCKER_REPO}:${CUSTOM_REL_NAME}-x86_64
-CUSTOM_REL_QUAY=${CUSTOM_REL_QUAY_REPO}:${CUSTOM_REL_NAME}-x86_64
+CUSTOM_RELEASE="${OPTV_REGISTRY}/ocp-release:${CUSTOM_REL_NAME}-x86_64"
 
 #
 # Collect info from the base release
 #
 log "Retrieving release information for ${REL_Z}"
-BASE_MACHINE_OS_CONTENT=$(oc adm release info -a "${OC_AUTH_FILE}" "${REL_Z}" --image-for=machine-os-content)
+BASE_MACHINE_OS_CONTENT=$(oc adm release info -a "${AUTH_FILE}" "${REL_Z}" --image-for=machine-os-content)
 if [ -z "${BASE_MACHINE_OS_CONTENT}" ]; then
     fatal "Unable to retrieve release info for ${REL_Z}"
 fi
 
-BASE_BUILD_ID=$(oc image info -a "${OC_AUTH_FILE}" "${BASE_MACHINE_OS_CONTENT}" -o json | jq -r '.config.config.Labels.version')
+BASE_BUILD_ID=$(oc image info -a "${AUTH_FILE}" "${BASE_MACHINE_OS_CONTENT}" -o json | jq -r '.config.config.Labels.version')
 if [ -z "${BASE_BUILD_ID}" ]; then
     fatal "Unable to determine build ID for ${REL_Z}"
 fi
 
-BASE_KERNEL_RT=$(oc image info -a "${OC_AUTH_FILE}" "${BASE_MACHINE_OS_CONTENT}" -o json | jq -r '.config.config.Labels."com.coreos.rpm.kernel-rt-core"')
+BASE_KERNEL_RT=$(oc image info -a "${AUTH_FILE}" "${BASE_MACHINE_OS_CONTENT}" -o json | jq -r '.config.config.Labels."com.coreos.rpm.kernel-rt-core"')
 if [ -z "${BASE_KERNEL_RT}" ]; then
     fatal "Unable to determine kernel-rt version for ${REL_Z}"
 fi
 
-FROM_REL_DIGEST=$(oc adm release info -a "${OC_AUTH_FILE}" "${REL_Z}" -o jsonpath='{.digest}')
+FROM_REL_DIGEST=$(oc adm release info -a "${AUTH_FILE}" "${REL_Z}" -o jsonpath='{.digest}')
 FROM_REL_IMAGE="quay.io/openshift-release-dev/ocp-release@${FROM_REL_DIGEST}"
 
 if [ -z "${FROM_REL_DIGEST}" ]; then
@@ -254,6 +267,20 @@ fi
 
 if ! cp redhat-coreos/content_sets.yaml src/config/; then
     fatal "Failed to copy content_sets.yaml"
+fi
+
+#
+# Workaround repo name mismatches
+#
+if [ "${REL_Y}" = "4.10" ]; then
+    sed -i \
+        -e 's/rhel-8.4-advanced-virt/rhel-8-advanced-virt/' \
+        -e 's/rhel-8.4-appstream/rhel-8-appstream/' \
+        -e 's/rhel-8.4-baseos/rhel-8-baseos/' \
+        -e 's/rhel-8.4-fast-datapath/rhel-8-fast-datapath/' \
+        -e 's/rhel-8.4-nfv/rhel-8-nfv/' \
+        -e 's/rhel-8.4-server-ose-4.10/rhel-8-server-ose/' \
+        src/config/manifest.yaml src/config/extensions.yaml
 fi
 
 #
@@ -419,7 +446,7 @@ fi
 # Generate the machine-os-content container image
 #
 log "Generating machine-os-content container image"
-if ! cosa upload-oscontainer --name "${CUSTOM_OS_CONTENT_REPO}"; then
+if ! cosa upload-oscontainer --name "${OPTV_REGISTRY}/machine-os-content"; then
     fatal "cosa upload-oscontainer failed"
 fi
 
@@ -427,56 +454,33 @@ fi
 # Generate the custom release
 #
 log "Generating custom release"
-CUSTOM_OS_CONTENT=${CUSTOM_OS_CONTENT_REPO}:${CUSTOM_BUILD_VERSION}
-if ! oc adm release new \
+CUSTOM_OS_CONTENT="${OPTV_REGISTRY}/machine-os-content:${CUSTOM_BUILD_VERSION}"
+if ! oc adm release new -a "${AUTH_FILE}" \
     --from-release="${FROM_REL_IMAGE}" \
     machine-os-content="${CUSTOM_OS_CONTENT}" \
-    --to-image="${CUSTOM_REL_DOCKER}" \
+    --to-image="${CUSTOM_RELEASE}" \
     --name "${CUSTOM_REL_NAME}" \
     "${IMG_OVERRIDES[@]}"; then
     fatal "Failed to create release"
 fi
 
-#
-# Mirror release image to quay repo
-#
-if ! podman pull "${CUSTOM_REL_DOCKER}"; then
-    fatal "Failed to pull ${CUSTOM_REL_DOCKER}"
-fi
-
-if ! podman tag "${CUSTOM_REL_DOCKER}" "${CUSTOM_REL_QUAY}"; then
-    fatal "Failed to retag ${CUSTOM_REL_DOCKER}"
-fi
-
-if ! podman push "${CUSTOM_REL_QUAY}"; then
-    fatal "Failed to push ${CUSTOM_REL_QUAY}"
+if podman image exists "${CUSTOM_RELEASE}" && ! podman rmi "${CUSTOM_RELEASE}"; then
+    fatal "Failed to clean up image: ${CUSTOM_RELEASE}"
 fi
 
 #
-# Determine the quay digest ID for the release image, in order to run the upgrade
+# Determine the digest ID for the release image, in order to run the upgrade
 #
-if ! podman rmi "${CUSTOM_REL_DOCKER}" "${CUSTOM_REL_QUAY}"; then
-    fatal "Failed to clean up images: ${CUSTOM_REL_DOCKER} ${CUSTOM_REL_QUAY}"
-fi
-
-if ! podman pull "${CUSTOM_REL_QUAY}"; then
-    fatal "Failed to pull ${CUSTOM_REL_QUAY}"
-fi
-
-CUSTOM_REL_DIGEST=$(podman inspect "${CUSTOM_REL_QUAY}" | jq -r '.[]["RepoDigests"][0]')
+CUSTOM_REL_DIGEST=$(skopeo inspect --authfile "${AUTH_FILE}" docker://"${CUSTOM_RELEASE}" | jq -r '.Digest')
 if [ -z "${CUSTOM_REL_DIGEST}" ]; then
     fatal "Failed to determine custom release image digest"
-fi
-
-if ! podman rmi "${CUSTOM_REL_QUAY}"; then
-    fatal "Failed to clean up image: ${CUSTOM_REL_QUAY}"
 fi
 
 #
 # Build was successful.
 #
 echo -e "\nSuccessfully built release image:"
-echo "${CUSTOM_REL_QUAY}"
+echo "${CUSTOM_RELEASE}"
 
 echo -e "\nThe following image(s) have been overridden from release ${REL_Z}:"
 echo "    machine-os-content=${CUSTOM_OS_CONTENT}"
@@ -486,6 +490,7 @@ done
 
 echo -e "\nTo upgrade to custom release:"
 echo "oc adm upgrade --to-image=${CUSTOM_REL_DIGEST} --allow-explicit-upgrade --force"
+echo "oc adm upgrade --to-image=${OPTV_REGISTRY}/ocp-release@${CUSTOM_REL_DIGEST} --allow-explicit-upgrade --force"
 
 exit 0
 

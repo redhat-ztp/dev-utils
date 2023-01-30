@@ -140,6 +140,24 @@ function download_pkgs {
 }
 
 #
+# Determine URL for lockfile
+#
+function get_lockfile_url {
+    local baseurl=https://releases-rhcos-art.apps.ocp-virt.prod.psi.redhat.com
+    local lockfile=manifest-lock.generated.x86_64.json
+
+    local url="${baseurl}/storage/releases/rhcos-${RELEASE}/${BASE_BUILD_ID}/x86_64/${lockfile}"
+    if curl -s -I "${url}" | grep -q '200 OK'; then
+        echo "${url}"
+    else
+        url="${baseurl}/storage/prod/streams/${RELEASE}/builds/${BASE_BUILD_ID}/x86_64/${lockfile}"
+        if curl -s -I "${url}" | grep -q '200 OK'; then
+            echo "${url}"
+        fi
+    fi
+}
+
+#
 # Process cmdline arguments
 #
 if ! OPTS=$(getopt -o "h,r:,b:,p:,l:" --long "help,rel:,build:,pkg:,lockfile:" --name "$0" -- "$@"); then
@@ -220,7 +238,6 @@ fi
 # Download lockfile and any packages missing from main repos
 #
 LOCKFILE=${CONFIG_DIR}/manifest-lock.x86_64.json
-LOCKFILE_URL=https://releases-rhcos-art.apps.ocp-virt.prod.psi.redhat.com/storage/releases/rhcos-${RELEASE}/${BASE_BUILD_ID}/x86_64/manifest-lock.generated.x86_64.json
 
 if [ -n "${LOCAL_LOCKFILE}" ]; then
     log "Using local lockfile ${LOCAL_LOCKFILE}"
@@ -228,6 +245,11 @@ if [ -n "${LOCAL_LOCKFILE}" ]; then
         fatal "Unable to copy lockfile to ${LOCKFILE}"
     fi
 else
+    LOCKFILE_URL=$(get_lockfile_url)
+    if [ -z "${LOCKFILE_URL}" ]; then
+        fatal "Unable to find manifest-lock.x86_64.json for ${RELEASE}"
+    fi
+
     log "Downloading ${LOCKFILE_URL}"
     if ! wget -q "${LOCKFILE_URL}" -O "${LOCKFILE}"; then
         fatal "Unable to download lockfile for ${BASE_BUILD_ID}"
