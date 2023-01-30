@@ -182,9 +182,9 @@ if [[ ! "${REL_Z}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     fatal "Z-stream does not match x.y.z format"
 fi
 
-DOWNLOAD_RPMS="${SCRIPTDIR}/rhcos-build-download-pkgs.sh"
+DOWNLOAD_RPMS="${SCRIPTDIR}/optv-build-download-pkgs.sh"
 if [ ! -x "${DOWNLOAD_RPMS}" ]; then
-    fatal "Could not find rhcos-build-download-pkgs.sh executable script in ${SCRIPTDIR}"
+    fatal "Could not find optv-build-download-pkgs.sh executable script in ${SCRIPTDIR}"
 fi
 
 if [ -z "$(which cosa)" ]; then
