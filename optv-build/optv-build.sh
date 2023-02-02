@@ -6,16 +6,27 @@
 PROG=$(basename "$0")
 SCRIPTDIR=$(dirname "$(readlink -f "$0")")
 
+OPTV_REPO_DIR=
+function cleanup {
+    if [ -n "${OPTV_REPO_DIR}" ] && [ -d "${OPTV_REPO_DIR}" ]; then
+        rm -rf "${OPTV_REPO_DIR}"
+    fi
+}
+
+trap cleanup EXIT
+
 #
 # Check required tools
 #
 REQUIRED_TOOLS=(
     createrepo
     curl
+    git
     jq
     oc
     podman
     repoquery
+    rpmdev-vercmp
     skopeo
     wget
 )
@@ -39,11 +50,12 @@ Usage: ${PROG} ...
 Parameters:
     --auth <auth file>              Auth file for oc commands and OPTV registry
     --optv-registry <reg>           Registry for built images
-    --pkg-dir <dir>                 Directory containing custom RPMs to override
     --suffix <name>                 Suffix for custom release version
     -z <z-stream>                   Baseline Z-stream (eg. 4.10.26)
 
 Optional parameters:
+    --optv-htpath <url>             URL for OPTV software repo server basedir
+    --pkg-dir <dir>                 Directory containing custom RPMs to override
     --add-pkg <pkgname>             New rpm in pkg-dir to install in image
     --add-kernel-rt-pkg <pkgname>   New rpm in pkg-dir to install with kernel-rt packages
     --img-override <img>            Additional image to override
@@ -68,10 +80,12 @@ function log {
 # https://coreos.github.io/coreos-assembler/building-fcos/#define-a-bash-alias-to-run-cosa
 #
 # Note: Minor formatting changes have been made to appease shellcheck and bashate
+# Note: Added origflags check to avoid clearing bash -x flag
 #
 function cosa {
     env | grep COREOS_ASSEMBLER
     local -r COREOS_ASSEMBLER_CONTAINER_LATEST="quay.io/coreos-assembler/coreos-assembler:latest"
+    local origflags="$-"
     # shellcheck disable=SC2091
     if [[ -z ${COREOS_ASSEMBLER_CONTAINER} ]] && $(podman image exists ${COREOS_ASSEMBLER_CONTAINER_LATEST}); then
         local cosa_build_date_str=
@@ -98,13 +112,13 @@ function cosa {
                 ${COREOS_ASSEMBLER_GIT:+-v $COREOS_ASSEMBLER_GIT/src/:/usr/lib/coreos-assembler/:ro}  \
                 ${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS}                                            \
                 ${COREOS_ASSEMBLER_CONTAINER:-$COREOS_ASSEMBLER_CONTAINER_LATEST} "$@"
-    rc=$?; set +x; return $rc
+    rc=$?; [[ $origflags != *x* ]] && set +x; return $rc
 }
 
 #
 # Process command-line args
 #
-if ! OPTS=$(getopt -o "h,z:" --long "help,,auth:,optv-registry:,pkg-dir:,quay:,suffix:,img-override:,add-kernel-rt-pkg:,add-pkg:" --name "$0" -- "$@"); then
+if ! OPTS=$(getopt -o "h,z:" --long "help,,auth:,optv-registry:,optv-htpath:,pkg-dir:,quay:,suffix:,img-override:,add-kernel-rt-pkg:,add-pkg:" --name "$0" -- "$@"); then
     usage
     exit 1
 fi
@@ -112,6 +126,8 @@ fi
 eval set -- "${OPTS}"
 
 declare OPTV_REGISTRY=
+declare OPTV_HTPATH=
+declare OPTV_BUILD_URL=
 declare AUTH_FILE=${HOME}/.docker/config.json
 declare PKG_DIR=
 declare REL_Z=
@@ -128,6 +144,10 @@ while :; do
             ;;
         --optv-registry)
             OPTV_REGISTRY="$2"
+            shift 2
+            ;;
+        --optv-htpath)
+            OPTV_HTPATH="$2"
             shift 2
             ;;
         --pkg-dir)
@@ -169,7 +189,6 @@ done
 
 if [ -z "${OPTV_REGISTRY}" ] || \
     [ -z "${AUTH_FILE}" ] || \
-    [ -z "${PKG_DIR}" ] || \
     [ -z "${REL_Z}" ] || \
     [ -z "${SUFFIX}" ]; then
     usage
@@ -187,21 +206,69 @@ if [ ! -x "${DOWNLOAD_RPMS}" ]; then
     fatal "Could not find optv-build-download-pkgs.sh executable script in ${SCRIPTDIR}"
 fi
 
-if [ -z "$(which cosa)" ]; then
-    fatal "cosa alias is not setup"
+if [ -n "${PKG_DIR}" ]; then
+    shopt -s nullglob
+    OVERRIDES=( "${PKG_DIR}"/*.rpm )
+    if [ ${#OVERRIDES} -eq 0 ]; then
+        fatal "Did not find packages in ${PKG_DIR}"
+    fi
+    shopt -u nullglob
 fi
-
-shopt -s nullglob
-OVERRIDES=( "${PKG_DIR}"/*.rpm )
-if [ ${#OVERRIDES} -eq 0 ]; then
-    fatal "Did not find packages in ${PKG_DIR}"
-fi
-shopt -u nullglob
 
 #
 # Setup environment variables
 #
 REL_Y=${REL_Z%\.*}
+
+if [ -n "${OPTV_HTPATH}" ]; then
+    OPTV_BUILD_URL="${OPTV_HTPATH}/${REL_Y}/${REL_Z}"
+    if ! curl --fail -s "${OPTV_BUILD_URL}/" >/dev/null ; then
+        fatal "Build not found: ${OPTV_BUILD_URL}"
+    fi
+
+    OPTV_REPO_DIR=$(mktemp --tmpdir -d optv-repo-XXXXXX)
+    cat <<EOF >"${OPTV_REPO_DIR}/optv.repo"
+[optv]
+enabled=1
+gpgcheck=0
+baseurl=${OPTV_BUILD_URL}
+EOF
+    yum clean expire-cache >/dev/null 2>&1
+
+    if [ -n "${PKG_DIR}" ]; then
+        # Verify that each custom package is the newest in overrides, in case there was a newer package in the OPTV repo
+        log "Checking packages in ${PKG_DIR} against ${OPTV_BUILD_URL}"
+        for pkg in "${PKG_DIR}"/*.rpm; do
+            name=$(rpm -qp --qf '%{NAME}' "${pkg}")
+            optv_evra=$(repoquery -q --setopt reposdir=${OPTV_REPO_DIR} --latest-limit 1 --qf '%{epoch}:%{version}-%{release}.%{arch}' "${name}")
+            if [ -z "${optv_evra}" ]; then
+                continue
+            fi
+            custom_pkg_evra=$(rpm -qp --qf '%|EPOCH?{%{EPOCH}}:{0}|:%{VERSION}-%{RELEASE}.%{ARCH}' "${pkg}")
+
+            # rpmdev-vercmp compares two package versions and returns:
+            # - 0 if equal
+            # - 11 if first is newer
+            # - 12 if second is newer
+            rpmdev-vercmp "${custom_pkg_evra}" "${optv_evra}" >/dev/null
+            case $? in
+                0)
+                    fatal "${pkg} has equivalent version in OPTV repo (version: ${optv_evra})"
+                    ;;
+                11)
+                    continue
+                    ;;
+                12)
+                    fatal "${pkg} has higher version in OPTV repo (version: ${optv_evra})"
+                    ;;
+                *)
+                    fatal "Error comparing version of ${pkg} against OPTV repo (version: ${optv_evra})"
+                    ;;
+            esac
+        done
+    fi
+fi
+
 export COREOS_ASSEMBLER_CONTAINER=quay.io/coreos-assembler/coreos-assembler:rhcos-${REL_Y}
 
 if [[ ! -f /dev/kvm && ! "${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS}" =~ "--env COSA_NO_KVM=1" ]]; then
@@ -216,8 +283,8 @@ fi
 # Bind-mount certs for cosa
 export COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS="${COREOS_ASSEMBLER_CONTAINER_RUNTIME_ARGS} -v /etc/pki/ca-trust:/etc/pki/ca-trust"
 
-CUSTOM_REL_NAME="${REL_Z}-${SUFFIX}.$(date -u +%Y%m%d%H%M)"
-CUSTOM_RELEASE="${OPTV_REGISTRY}/ocp-release:${CUSTOM_REL_NAME}-x86_64"
+CUSTOM_VERSION="${REL_Z}-${SUFFIX}.$(date -u +%Y%m%d%H%M)"
+CUSTOM_RELEASE="${OPTV_REGISTRY}/ocp-release:${CUSTOM_VERSION}-x86_64"
 
 #
 # Collect info from the base release
@@ -302,29 +369,86 @@ fi
 #
 # Setup overrides
 #
-log "Adding custom packages"
-if ! cd overrides/rpm; then
-    fatal "Failed to cd to overrides/rpm"
+if [ -n "${OPTV_BUILD_URL}" ]; then
+    if ! cd overrides/rpm; then
+        fatal "Failed to cd to overrides/rpm"
+    fi
+
+    yum clean expire-cache >/dev/null 2>&1
+
+    mapfile -t CARRYOVER_PKGS < <(repoquery -q --setopt reposdir=${OPTV_REPO_DIR} --latest-limit 1 -a --location)
+    for pkg in "${CARRYOVER_PKGS[@]}"; do
+        log "Downloading ${pkg}"
+        if ! wget -q --backups=0 "${pkg}"; then
+            fatal "Failed to download ${pkg}"
+        fi
+    done
+
+    rm -rf repodata/
+    if !  createrepo .; then
+        fatal "createrepo failed"
+    fi
+
+    yum clean expire-cache >/dev/null 2>&1
+
+    if ! cd ../..; then
+        fatal "Failed to cd to original pwd"
+    fi
+
+    #
+    # Get additional package lists
+    #
+    addpkgs=$(curl --fail -s ${OPTV_BUILD_URL}/add-pkg.txt | sed -e 's/[[:space:]]*//' -e 's/#.*//' -e '/^$/d' | sort -u)
+    if [ -n "${addpkgs}" ]; then
+        EXTRA_PKGS+=( "${addpkgs}" )
+    fi
+
+    addpkgsrt=$(curl --fail -s ${OPTV_BUILD_URL}/add-pkg-rt.txt | sed -e 's/[[:space:]]*//' -e 's/#.*//' -e '/^$/d' | sort -u)
+    if [ -n "${addpkgsrt}" ]; then
+        EXTRA_KERNEL_RT_PKGS+=( "${addpkgsrt}" )
+    fi
 fi
 
-if ! cp "${PKG_DIR}"/*.rpm .; then
-    fatal "Failed to copy ${PKG_DIR}/*.rpm"
+#
+# Strip duplicates from package lists
+#
+if [ ${#EXTRA_PKGS[@]} -gt 0 ]; then
+    mapfile -t EXTRA_PKGS < <( IFS=$'\n'; sort -u <<<"${EXTRA_PKGS[*]}" )
 fi
 
-if !  createrepo .; then
-    fatal "createrepo failed"
+if [ ${#EXTRA_KERNEL_RT_PKGS[@]} -gt 0 ]; then
+    mapfile -t EXTRA_KERNEL_RT_PKGS < <( IFS=$'\n'; sort -u <<<"${EXTRA_KERNEL_RT_PKGS[*]}" )
 fi
 
-if ! cd ../..; then
-    fatal "Failed to cd to original pwd"
-fi
+#
+# Add custom packages
+#
+if [ -n "${PKG_DIR}" ]; then
+    log "Adding custom packages"
+    if ! cd overrides/rpm; then
+        fatal "Failed to cd to overrides/rpm"
+    fi
 
-yum clean expire-cache >/dev/null 2>&1
+    if ! cp "${PKG_DIR}"/*.rpm .; then
+        fatal "Failed to copy ${PKG_DIR}/*.rpm"
+    fi
+
+    rm -rf repodata/
+    if !  createrepo .; then
+        fatal "createrepo failed"
+    fi
+
+    yum clean expire-cache >/dev/null 2>&1
+
+    if ! cd ../..; then
+        fatal "Failed to cd to original pwd"
+    fi
+fi
 
 #
 # Workaround for kernel-rt packages
 #
-OVERRIDE_KERNEL_RT_VER=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --qf '%{version}-%{release}.%{arch}' kernel-rt-core)
+OVERRIDE_KERNEL_RT_VER=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --latest-limit 1 --qf '%{version}-%{release}.%{arch}' kernel-rt-core)
 
 log "Locking kernel-rt version to ${OVERRIDE_KERNEL_RT_VER:-${BASE_KERNEL_RT}}"
 if ! sed -i -e '/^  kernel-rt:/a\    repos:\n      - coreos-assembler-local-overrides' -e "s/\(- kernel-rt.*\)/\1-${OVERRIDE_KERNEL_RT_VER:-${BASE_KERNEL_RT}}/" src/config/extensions.yaml; then
@@ -344,7 +468,7 @@ fi
 # shellcheck disable=SC2013
 for pkg in $(grep -- "- kernel-rt" src/config/extensions.yaml | sed 's/-//'); do
     log "Checking for ${pkg}"
-    location=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --location "${pkg}")
+    location=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --latest-limit 1 --location "${pkg}")
     if [ -z "${location}" ] || [ ! -f "overrides/rpm/$(basename "${location}")" ]; then
         fatal "RPM for ${pkg} not available in overrides/rpm"
     fi
@@ -365,12 +489,12 @@ if [ ${#EXTRA_PKGS[@]} -gt 0 ]; then
     log "Adding new packages"
     for pkg in "${EXTRA_PKGS[@]}"; do
         log "Adding ${pkg}"
-        location=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --location "${pkg}")
+        location=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --latest-limit 1 --location "${pkg}")
         if [ -z "${location}" ] || [ ! -f "overrides/rpm/$(basename "${location}")" ]; then
             fatal "RPM for ${pkg} not available in overrides/rpm"
         fi
 
-        nvra=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "${pkg}")
+        nvra=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --latest-limit 1 --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "${pkg}")
         if [ -z "${nvra}" ]; then
             fatal "Failed to determine NVRA for ${pkg}"
         fi
@@ -386,12 +510,12 @@ if [ ${#EXTRA_KERNEL_RT_PKGS[@]} -gt 0 ]; then
     log "Adding new kernel-rt packages"
     for pkg in "${EXTRA_KERNEL_RT_PKGS[@]}"; do
         log "Adding ${pkg}"
-        location=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --location "${pkg}")
+        location=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --latest-limit 1 --location "${pkg}")
         if [ -z "${location}" ] || [ ! -f "overrides/rpm/$(basename "${location}")" ]; then
             fatal "RPM for ${pkg} not available in overrides/rpm"
         fi
 
-        nvra=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "${pkg}")
+        nvra=$(repoquery -q --disablerepo '*' --repofrompath overrides,overrides/rpm --latest-limit 1 --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' "${pkg}")
         if [ -z "${nvra}" ]; then
             fatal "Failed to determine NVRA for ${pkg}"
         fi
@@ -407,7 +531,7 @@ fi
 # Run the build
 #
 log "Running build"
-if ! cosa build; then
+if ! cosa build --version "${CUSTOM_VERSION}"; then
     fatal "cosa build failed"
 fi
 
@@ -455,12 +579,14 @@ fi
 #
 log "Generating custom release"
 CUSTOM_OS_CONTENT="${OPTV_REGISTRY}/machine-os-content:${CUSTOM_BUILD_VERSION}"
+IMG_OVERRIDES+=( "machine-os-content=${CUSTOM_OS_CONTENT}" )
+mapfile -t sorted_overrides < <( IFS=$'\n'; sort -u <<<"${IMG_OVERRIDES[*]}" )
+
 if ! oc adm release new -a "${AUTH_FILE}" \
     --from-release="${FROM_REL_IMAGE}" \
-    machine-os-content="${CUSTOM_OS_CONTENT}" \
     --to-image="${CUSTOM_RELEASE}" \
-    --name "${CUSTOM_REL_NAME}" \
-    "${IMG_OVERRIDES[@]}"; then
+    --name "${CUSTOM_VERSION}" \
+    "${sorted_overrides[@]}"; then
     fatal "Failed to create release"
 fi
 
@@ -479,18 +605,36 @@ fi
 #
 # Build was successful.
 #
+set +x
 echo -e "\nSuccessfully built release image:"
 echo "${CUSTOM_RELEASE}"
 
 echo -e "\nThe following image(s) have been overridden from release ${REL_Z}:"
-echo "    machine-os-content=${CUSTOM_OS_CONTENT}"
-for img in "${IMG_OVERRIDES[@]}"; do
+for img in "${sorted_overrides[@]}"; do
     echo "    ${img}"
 done
 
 echo -e "\nTo upgrade to custom release:"
-echo "oc adm upgrade --to-image=${CUSTOM_REL_DIGEST} --allow-explicit-upgrade --force"
-echo "oc adm upgrade --to-image=${OPTV_REGISTRY}/ocp-release@${CUSTOM_REL_DIGEST} --allow-explicit-upgrade --force"
+echo "oc adm upgrade --allow-explicit-upgrade --force \\"
+echo "    --to-image=${CUSTOM_REL_DIGEST}"
+echo "oc adm upgrade --allow-explicit-upgrade --force \\"
+echo "    --to-image=${OPTV_REGISTRY}/ocp-release@${CUSTOM_REL_DIGEST}"
+
+echo -e "\nTo rebuild the custom release, with modified --to-image or --name tags, run the following:"
+cat <<EOF
+oc adm release new -a "${AUTH_FILE}" \\
+    --from-release="${FROM_REL_IMAGE}" \\
+    --to-image="${CUSTOM_RELEASE}" \\
+    --name "${CUSTOM_VERSION}" \\
+EOF
+for ((idx=0; idx<${#sorted_overrides[@]}; idx++)); do
+    echo -n "    ${sorted_overrides[${idx}]}"
+    if [ $((idx+1)) -eq ${#sorted_overrides[@]} ]; then
+        echo
+    else
+        echo " \\"
+    fi
+done
 
 exit 0
 
