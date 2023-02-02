@@ -135,6 +135,7 @@ function download_pkgs {
     for pkg in "$@"; do
         download_rpm "${pkg}"
     done
+    rm -rf repodata/
     createrepo .
     yum clean expire-cache >/dev/null 2>&1
 }
