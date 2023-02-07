@@ -7,9 +7,14 @@ PROG=$(basename "$0")
 SCRIPTDIR=$(dirname "$(readlink -f "$0")")
 
 OPTV_REPO_DIR=
+WORKDIR=
 function cleanup {
     if [ -n "${OPTV_REPO_DIR}" ] && [ -d "${OPTV_REPO_DIR}" ]; then
         rm -rf "${OPTV_REPO_DIR}"
+    fi
+
+    if [ -n "${WORKDIR}" ] && [ -d "${WORKDIR}" ]; then
+        rm -rf "${WORKDIR}"
     fi
 }
 
@@ -59,6 +64,7 @@ Optional parameters:
     --add-pkg <pkgname>             New rpm in pkg-dir to install in image
     --add-kernel-rt-pkg <pkgname>   New rpm in pkg-dir to install with kernel-rt packages
     --img-override <img>            Additional image to override
+    --summary-yaml                  Generate yaml summary image
 
 The add-pkg and img-override options can be specified multiple times.
 
@@ -116,9 +122,57 @@ function cosa {
 }
 
 #
+# Generate a YAML summary image
+#
+function summary_yaml {
+    cat <<EOF
+---
+build:
+  zstream: ${REL_Z}
+  version: ${CUSTOM_VERSION}
+  images:
+EOF
+    for img in "${sorted_overrides[@]}"; do
+        echo "    - ${img}"
+    done
+
+    if [ "${#CARRYOVER_PKGS[@]}" -gt 0 ]; then
+        echo "  customized-packages:"
+        mapfile -t sorted_pkgs < <( IFS=$'\n'; sort -u <<<"${!CARRYOVER_PKGS[*]}" )
+        for pkg in "${sorted_pkgs[@]}"; do
+            echo "    - name: ${pkg}"
+            echo "      version: ${CARRYOVER_PKGS[${pkg}]}"
+        done
+    fi
+
+    if [ "${#USER_PKGS[@]}" -gt 0 ]; then
+        echo "  user-customized-packages:"
+        mapfile -t sorted_pkgs < <( IFS=$'\n'; sort -u <<<"${!USER_PKGS[*]}" )
+        for pkg in "${sorted_pkgs[@]}"; do
+            echo "    - name: ${pkg}"
+            echo "      version: ${USER_PKGS[${pkg}]}"
+        done
+    fi
+
+    if [ "${#EXTRA_PKGS[@]}" -gt 0 ]; then
+        echo "  added-packages:"
+        for pkg in "${EXTRA_PKGS[@]}"; do
+            echo "    - ${pkg}"
+        done
+    fi
+
+    if [ "${#EXTRA_KERNEL_RT_PKGS[@]}" -gt 0 ]; then
+        echo "  added-realtime-packages:"
+        for pkg in "${EXTRA_KERNEL_RT_PKGS[@]}"; do
+            echo "    - ${pkg}"
+        done
+    fi
+}
+
+#
 # Process command-line args
 #
-if ! OPTS=$(getopt -o "h,z:" --long "help,,auth:,optv-registry:,optv-htpath:,pkg-dir:,quay:,suffix:,img-override:,add-kernel-rt-pkg:,add-pkg:" --name "$0" -- "$@"); then
+if ! OPTS=$(getopt -o "h,z:" --long "help,,auth:,optv-registry:,optv-htpath:,pkg-dir:,quay:,suffix:,img-override:,add-kernel-rt-pkg:,add-pkg:,summary-yaml" --name "$0" -- "$@"); then
     usage
     exit 1
 fi
@@ -132,9 +186,13 @@ declare AUTH_FILE=${HOME}/.docker/config.json
 declare PKG_DIR=
 declare REL_Z=
 declare SUFFIX=
+declare SUMMARY_YAML=no
 declare -a IMG_OVERRIDES=()
 declare -a EXTRA_KERNEL_RT_PKGS=()
 declare -a EXTRA_PKGS=()
+
+declare -A USER_PKGS=()
+declare -A CARRYOVER_PKGS=()
 
 while :; do
     case "$1" in
@@ -157,6 +215,10 @@ while :; do
         --suffix)
             SUFFIX="$2"
             shift 2
+            ;;
+        --summary-yaml)
+            SUMMARY_YAML=yes
+            shift
             ;;
         -z)
             REL_Z="$2"
@@ -240,11 +302,15 @@ EOF
         log "Checking packages in ${PKG_DIR} against ${OPTV_BUILD_URL}"
         for pkg in "${PKG_DIR}"/*.rpm; do
             name=$(rpm -qp --qf '%{NAME}' "${pkg}")
+            custom_pkg_evra=$(rpm -qp --qf '%|EPOCH?{%{EPOCH}}:{0}|:%{VERSION}-%{RELEASE}.%{ARCH}' "${pkg}")
+
+            # Store pkg info for summary
+            USER_PKGS+=(["${name}"]="${custom_pkg_evra}")
+
             optv_evra=$(repoquery -q --setopt reposdir=${OPTV_REPO_DIR} --latest-limit 1 --qf '%{epoch}:%{version}-%{release}.%{arch}' "${name}")
             if [ -z "${optv_evra}" ]; then
                 continue
             fi
-            custom_pkg_evra=$(rpm -qp --qf '%|EPOCH?{%{EPOCH}}:{0}|:%{VERSION}-%{RELEASE}.%{ARCH}' "${pkg}")
 
             # rpmdev-vercmp compares two package versions and returns:
             # - 0 if equal
@@ -369,6 +435,35 @@ fi
 #
 # Setup overrides
 #
+
+#
+# Add custom packages
+#
+if [ -n "${PKG_DIR}" ]; then
+    log "Adding custom packages"
+    if ! cd overrides/rpm; then
+        fatal "Failed to cd to overrides/rpm"
+    fi
+
+    if ! cp "${PKG_DIR}"/*.rpm .; then
+        fatal "Failed to copy ${PKG_DIR}/*.rpm"
+    fi
+
+    rm -rf repodata/
+    if !  createrepo .; then
+        fatal "createrepo failed"
+    fi
+
+    yum clean expire-cache >/dev/null 2>&1
+
+    if ! cd ../..; then
+        fatal "Failed to cd to original pwd"
+    fi
+fi
+
+#
+# Download carryover custom packages
+#
 if [ -n "${OPTV_BUILD_URL}" ]; then
     if ! cd overrides/rpm; then
         fatal "Failed to cd to overrides/rpm"
@@ -376,12 +471,21 @@ if [ -n "${OPTV_BUILD_URL}" ]; then
 
     yum clean expire-cache >/dev/null 2>&1
 
-    mapfile -t CARRYOVER_PKGS < <(repoquery -q --setopt reposdir=${OPTV_REPO_DIR} --latest-limit 1 -a --location)
-    for pkg in "${CARRYOVER_PKGS[@]}"; do
-        log "Downloading ${pkg}"
-        if ! wget -q --backups=0 "${pkg}"; then
-            fatal "Failed to download ${pkg}"
+    for pkg in $(repoquery -q --setopt reposdir="${OPTV_REPO_DIR}" --latest-limit 1 -a --qf '%{name}'); do
+        # Check if package was overridden by the user
+        if [ ${USER_PKGS["${pkg}"]+_} ]; then
+            log "Skipping ${pkg}, as it is overridden in ${PKG_DIR}"
+            continue
         fi
+
+        pkg_url=$(repoquery -q --setopt reposdir="${OPTV_REPO_DIR}" --latest-limit 1 --location "${pkg}")
+        log "Downloading ${pkg_url}"
+        if ! wget -q --backups=0 "${pkg_url}"; then
+            fatal "Failed to download ${pkg_url}"
+        fi
+
+        pkg_evra=$(rpm -qp --qf '%|EPOCH?{%{EPOCH}}:{0}|:%{VERSION}-%{RELEASE}.%{ARCH}' $(basename "${pkg_url}"))
+        CARRYOVER_PKGS+=(["${pkg}"]="${pkg_evra}")
     done
 
     rm -rf repodata/
@@ -418,31 +522,6 @@ fi
 
 if [ ${#EXTRA_KERNEL_RT_PKGS[@]} -gt 0 ]; then
     mapfile -t EXTRA_KERNEL_RT_PKGS < <( IFS=$'\n'; sort -u <<<"${EXTRA_KERNEL_RT_PKGS[*]}" )
-fi
-
-#
-# Add custom packages
-#
-if [ -n "${PKG_DIR}" ]; then
-    log "Adding custom packages"
-    if ! cd overrides/rpm; then
-        fatal "Failed to cd to overrides/rpm"
-    fi
-
-    if ! cp "${PKG_DIR}"/*.rpm .; then
-        fatal "Failed to copy ${PKG_DIR}/*.rpm"
-    fi
-
-    rm -rf repodata/
-    if !  createrepo .; then
-        fatal "createrepo failed"
-    fi
-
-    yum clean expire-cache >/dev/null 2>&1
-
-    if ! cd ../..; then
-        fatal "Failed to cd to original pwd"
-    fi
 fi
 
 #
@@ -603,11 +682,41 @@ if [ -z "${CUSTOM_REL_DIGEST}" ]; then
 fi
 
 #
+# Generate summary yaml, if requested
+#
+if [ "${SUMMARY_YAML}" = "yes" ]; then
+    log "Generating summary"
+
+    WORKDIR=$(mktemp --tmpdir -d summary-XXXXXX)
+    summary_yaml > "${WORKDIR}/summary.yaml"
+
+    # Generate summary image
+    cat <<EOF > "${WORKDIR}/Dockerfile"
+FROM scratch
+COPY summary.yaml .
+EOF
+
+    BUILDINFO_IMG="${OPTV_REGISTRY}/buildinfo:${CUSTOM_VERSION}"
+    BUILDINFO_IMG_LATEST="${OPTV_REGISTRY}/buildinfo:${REL_Z}-${SUFFIX}.latest"
+    podman build -t "${BUILDINFO_IMG}" "${WORKDIR}" && \
+        podman push --authfile "${AUTH_FILE}" "${BUILDINFO_IMG}" && \
+        podman tag "${BUILDINFO_IMG}" "${BUILDINFO_IMG_LATEST}" && \
+        podman push --authfile "${AUTH_FILE}" "${BUILDINFO_IMG_LATEST}" && \
+    if [ $? -ne 0 ]; then
+        fatal "Failed to generate and push buildinfo image"
+    fi
+
+    echo -e "\nPushed buildinfo image:"
+    echo "    ${BUILDINFO_IMG}"
+    echo "    ${BUILDINFO_IMG_LATEST}"
+fi
+
+#
 # Build was successful.
 #
 set +x
 echo -e "\nSuccessfully built release image:"
-echo "${CUSTOM_RELEASE}"
+echo "    ${CUSTOM_RELEASE}"
 
 echo -e "\nThe following image(s) have been overridden from release ${REL_Z}:"
 for img in "${sorted_overrides[@]}"; do
@@ -615,17 +724,17 @@ for img in "${sorted_overrides[@]}"; do
 done
 
 echo -e "\nTo upgrade to custom release:"
-echo "oc adm upgrade --allow-explicit-upgrade --force \\"
-echo "    --to-image=${CUSTOM_REL_DIGEST}"
-echo "oc adm upgrade --allow-explicit-upgrade --force \\"
-echo "    --to-image=${OPTV_REGISTRY}/ocp-release@${CUSTOM_REL_DIGEST}"
+echo "    oc adm upgrade --allow-explicit-upgrade --force \\"
+echo "        --to-image=${CUSTOM_REL_DIGEST}"
+echo "    oc adm upgrade --allow-explicit-upgrade --force \\"
+echo "        --to-image=${OPTV_REGISTRY}/ocp-release@${CUSTOM_REL_DIGEST}"
 
 echo -e "\nTo rebuild the custom release, with modified --to-image or --name tags, run the following:"
 cat <<EOF
-oc adm release new -a "${AUTH_FILE}" \\
-    --from-release="${FROM_REL_IMAGE}" \\
-    --to-image="${CUSTOM_RELEASE}" \\
-    --name "${CUSTOM_VERSION}" \\
+    oc adm release new -a "${AUTH_FILE}" \\
+        --from-release="${FROM_REL_IMAGE}" \\
+        --to-image="${CUSTOM_RELEASE}" \\
+        --name "${CUSTOM_VERSION}" \\
 EOF
 for ((idx=0; idx<${#sorted_overrides[@]}; idx++)); do
     echo -n "    ${sorted_overrides[${idx}]}"
@@ -635,6 +744,20 @@ for ((idx=0; idx<${#sorted_overrides[@]}; idx++)); do
         echo " \\"
     fi
 done
+
+if [ "${#USER_PKGS[@]}" -gt 0 ]; then
+    echo -e "\nThe following packages have been customized by the user:"
+    for pkg in "${!USER_PKGS[@]}"; do
+        echo "    ${pkg}-${USER_PKGS[${pkg}]}"
+    done | sort
+fi
+
+if [ "${#CARRYOVER_PKGS[@]}" -gt 0 ]; then
+    echo -e "\nThe following package customizations have been carried over:"
+    for pkg in "${!CARRYOVER_PKGS[@]}"; do
+        echo "    ${pkg}-${CARRYOVER_PKGS[${pkg}]}"
+    done | sort
+fi
 
 exit 0
 
