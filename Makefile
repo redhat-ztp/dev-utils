@@ -1,4 +1,7 @@
-SHELL :=/bin/bash
+SHELL := /bin/bash
+ENGINE ?= podman
+TAG ?= latest
+REPO ?= optv
 
 all: check
 .PHONY: all
@@ -38,3 +41,18 @@ check-markdownlint:
 endif
 .PHONY: check-markdownlint
 
+check_var_defined = \
+	$(if $(value $1),, \
+		$(error $1 must be set))
+
+check_optv_defined = \
+	$(call check_var_defined,OPTV_HOST) \
+	$(call check_var_defined,OPTV_REGPORT)
+
+optv-build: check
+	$(call check_optv_defined)
+	podman build -t $(OPTV_HOST):$(OPTV_REGPORT)/$(REPO)/builder:$(TAG) optv-build
+
+optv-push: optv-build
+	$(call check_optv_defined)
+	podman push $(OPTV_HOST):$(OPTV_REGPORT)/$(REPO)/builder:$(TAG)
