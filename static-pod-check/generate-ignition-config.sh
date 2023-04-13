@@ -31,7 +31,7 @@ function generate_ignition_config {
       {
         "overwrite": true,
         "path": "/usr/local/bin/${NAME}.sh",
-        "mode": 744,
+        "mode": 0744,
         "user": {
           "name": "root"
         },
@@ -45,10 +45,54 @@ function generate_ignition_config {
 EOF
 }
 
+function generate_machine_config {
+    local role=$1
+    cat <<EOF
+---
+kind: MachineConfig
+apiVersion: machineconfiguration.openshift.io/v1
+metadata:
+  name: 99-${NAME}-${role}
+  creationTimestamp:
+  labels:
+    machineconfiguration.openshift.io/role: ${role}
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    systemd:
+      units:
+      - name: static-pod-check-workaround.service
+        enabled: true
+        contents: |
+          [Unit]
+          Description=Check for stuck static pod revisions
+          After=kubelet.service
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStart=/usr/local/bin/${NAME}.sh ${WORKAROUND_OPTS}
+
+          [Install]
+          WantedBy=multi-user.target
+    storage:
+      files:
+      - overwrite: true
+        path: "/usr/local/bin/static-pod-check-workaround.sh"
+        mode: 0744
+        user:
+          name: root
+        contents:
+          source: "${WORKAROUND_ENCODED}"
+EOF
+}
+
 function usage {
     cat <<EOF
 Options:
     --override            Generate ignitionConfigOverride
+    --mc                  Generate MachineConfig
     --opts "<options>"    Set of options to pass as arguments to static pod health check utility
 EOF
     exit 1
@@ -57,12 +101,13 @@ EOF
 #
 # Process cmdline arguments
 #
-if ! OPTS=$(getopt -o "ho:" --long "help,override,opts:" --name "$0" -- "$@"); then
+if ! OPTS=$(getopt -o "ho:" --long "help,override,opts:,mc" --name "$0" -- "$@"); then
     usage
     exit 1
 fi
 
 GEN_OVERRIDE="no"
+GEN_MC="no"
 
 eval set -- "${OPTS}"
 
@@ -70,6 +115,10 @@ while :; do
     case "$1" in
         --override)
             GEN_OVERRIDE="yes"
+            shift
+            ;;
+        --mc)
+            GEN_MC="yes"
             shift
             ;;
         -o|--opts)
@@ -91,6 +140,9 @@ done
 
 if [ "${GEN_OVERRIDE}" = "yes" ]; then
     echo "ignitionConfigOverride: '$(generate_ignition_config | sed -z 's/\n */ /g' ; echo)'"
+elif [ "${GEN_MC}" = "yes" ]; then
+    generate_machine_config master
+    generate_machine_config worker
 else
     generate_ignition_config
 fi
