@@ -17,7 +17,7 @@ jobs:
 #      matrix:
 #        go: [ '1.16', '1.17' ]
 #    steps:
-#      - uses: actions/checkout@v2
+#      - uses: actions/checkout@v3
 #      - name: Install Go
 #        uses: actions/setup-go@v2
 #        with:
@@ -36,7 +36,7 @@ jobs:
     name: Shellcheck
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Run ShellCheck
       uses: ludeeus/action-shellcheck@master
       with:
@@ -46,9 +46,9 @@ jobs:
   bashate:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Setup python3
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v4
       with:
         python-version: '3.x'
     - name: Setup bashate
@@ -59,7 +59,7 @@ jobs:
   markdownlint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Markdown Lint
       uses: ruzickap/action-my-markdown-linter@v1
       with:
