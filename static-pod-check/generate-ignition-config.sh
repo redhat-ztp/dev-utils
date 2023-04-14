@@ -22,7 +22,7 @@ function generate_ignition_config {
       {
         "name": "${NAME}.service",
         "enabled": true,
-        "contents": "[Unit]\nDescription=Check for stuck static pod revisions\nAfter=kubelet.service\n\n[Service]\nType=simple\nUser=root\n\nExecStart=/usr/local/bin/${NAME}.sh ${WORKAROUND_OPTS}\n\n[Install]\nWantedBy=multi-user.target\n"
+        "contents": "[Unit]\nDescription=Check for stuck static pod revisions\nAfter=kubelet.service\n\n[Service]\nType=simple\nUser=root\n\nExecStart=/usr/local/bin/${NAME}.sh ${WORKAROUND_OPTS}\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n"
       }
     ]
   },
@@ -31,7 +31,7 @@ function generate_ignition_config {
       {
         "overwrite": true,
         "path": "/usr/local/bin/${NAME}.sh",
-        "mode": 0744,
+        "mode": 744,
         "user": {
           "name": "root"
         },
@@ -73,6 +73,7 @@ spec:
           Type=simple
           User=root
           ExecStart=/usr/local/bin/${NAME}.sh ${WORKAROUND_OPTS}
+          Restart=always
 
           [Install]
           WantedBy=multi-user.target

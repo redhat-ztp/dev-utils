@@ -75,7 +75,7 @@ function kubelet_running {
     local kubelet_start_time_secs
     local secs_since_start
 
-    kubelet_start_time=$(systemctl show kubelet.service --no-page | awk -F'=' '$1 == "ActiveEnterTimestamp" { print $2}')
+    kubelet_start_time=$(systemctl show kubelet.service --property ActiveEnterTimestamp --value)
     kubelet_start_time_secs=$(date --date="${kubelet_start_time}" +%s)
     secs_since_start=$(($(date +%s)-kubelet_start_time_secs))
 
@@ -183,7 +183,7 @@ Options:
     --verbose | -v                Turn on debug logs
     --log-to-stdout               Log to stdout instead of journald
     --manifests-dir | -m          Location of static pod manifests (default: /etc/kubernetes/manifests)
-    --kubelet-up-min <secs>       Minimum time, in seconds, kubelet must be active
+    --kubelet-up-minimum <secs>   Minimum time, in seconds, kubelet must be active
                                   before allowing health checks to run (default: 1200)
     --healthy-interval <secs>     Interval between checks, in seconds, when static
                                   pods are healthy (default: 300)
@@ -205,7 +205,7 @@ longopts=(
     "verbose"
     "log-to-stdout"
     "manifests-dir:"
-    "kubelet-up-min:"
+    "kubelet-up-minimum:"
     "healthy-interval:"
     "unhealthy-interval:"
     "max-failures:"
@@ -238,7 +238,7 @@ while :; do
             manifests_dir="${2}"
             shift 2
             ;;
-        --kubelet-up-min)
+        --kubelet-up-minimum)
             kubelet_up_minimum_secs="${2}"
             shift 2
             ;;
@@ -274,7 +274,8 @@ while :; do
     if kubelet_running && ! run_check ; then
         if [ "${dryrun}" = "no" ]; then
             loginfo "Restarting kubelet.service"
-            systemctl restart kubelet.service
+            systemctl stop kubelet.service
+            systemctl start kubelet.service
         else
             loginfo "Health check failed (dryrun only, not restarting kubelet)"
         fi
