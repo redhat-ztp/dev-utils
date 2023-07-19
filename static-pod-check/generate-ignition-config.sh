@@ -31,7 +31,7 @@ function generate_ignition_config {
       {
         "overwrite": true,
         "path": "/usr/local/bin/${NAME}.sh",
-        "mode": 744,
+        "mode": 484,
         "user": {
           "name": "root"
         },
