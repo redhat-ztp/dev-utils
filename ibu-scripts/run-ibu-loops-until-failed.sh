@@ -45,7 +45,9 @@ function display_summary {
 Summary:
 
 Upgrades completed: ${upgrades_completed}
-Upgrades with static pod revision rollouts: ${completed_with_rollouts}
+
+Upgrades with static pod revision rollouts: ${rollouts} in ${counter} loop(s)
+Upgrades with additional reboots detected:  ${reboots} in ${counter} loop(s)
 
 Upgrade stage completion times, including reboot:
     High:    ${w_reboot_high}
@@ -325,18 +327,43 @@ function checkForSriovKick {
 }
 
 #
+# Check to see reboots occurred during upgrade
+#
+function checkForReboots {
+    local count=
+    for ((i=0;i<5;i++)); do
+        count=$(${SSH_CMD} "last reboot | grep '^reboot' | grep -v 'still running' | wc -l")
+        if [ -n "${count}" ]; then
+            if [ "${count}" = "0" ]; then
+                return 0
+            else
+                log_with_pass_counter "Additional reboots detected: ${count}"
+                return 1
+            fi
+        fi
+
+        log_with_pass_counter "WARNING: Failed to connect to cluster" >&2
+        sleep 1
+    done
+
+    log_with_pass_counter "Failed to determine if additional reboots occurred" >&2
+    exit 1
+}
+
+#
 # Process cmdline arguments
 #
 declare SSH_KEY_ARG=
 declare SSH_HOST=
 declare HALT_ON_ROLLOUT=no
+declare HALT_ON_REBOOT_DETECTED=yes
 declare SSH_CMD=
 declare SEEDIMG=
 declare SEED_REVISIONS=
 declare -i MAX_LOOPS=-1
 
-LONGOPTS="help,ssh-key:,node:,rollout,max-loops:"
-OPTS=$(getopt -o "hk:n:rm:" --long "${LONGOPTS}" --name "$0" -- "$@")
+LONGOPTS="help,ssh-key:,node:,rollout,max-loops:,ignore-reboots"
+OPTS=$(getopt -o "hk:n:rm:i" --long "${LONGOPTS}" --name "$0" -- "$@")
 
 if [ $? -ne 0 ]; then
     usage
@@ -357,6 +384,10 @@ while :; do
             ;;
         -r|--rollout)
             HALT_ON_ROLLOUT=yes
+            shift
+            ;;
+        -i|--ignore-reboots)
+            HALT_ON_REBOOT_DETECTED=no
             shift
             ;;
         -m|--max-loops)
@@ -398,8 +429,8 @@ SSH_CMD="ssh -q ${SSH_KEY_ARG} -o StrictHostKeyChecking=no core@${SSH_HOST}"
 declare -i counter=0
 declare -i workarounds=0
 declare -i rollouts=0
+declare -i reboots=0
 declare -i upgrades_completed=0
-declare -i completed_with_rollouts=0
 
 declare -i upgrade_triggered_timestamp=0
 declare -i cluster_init_timestamp=0
@@ -452,17 +483,36 @@ while :; do
         log_with_pass_counter "Workaround was not required"
     fi
 
+    # For stats, perform all checks before determining if halt is required for user request
     log_with_pass_counter "Checking for revisions"
     getClusterRevisions
-    if [ $? -eq 1 ]; then
+    rollout_check_rc=$?
+    if [ ${rollout_check_rc} -eq 1 ]; then
         rollouts=$((rollouts+1))
-        if [ "${HALT_ON_ROLLOUT}" = "yes" ]; then
-            halt_reason="Halt requested due to rollout detection"
-            log_with_pass_counter "${halt_reason}"
-            exit 1
-        fi
     fi
 
+    log_with_pass_counter "Checking for additional reboots"
+    checkForReboots
+    reboot_check_rc=$?
+    if [ ${reboot_check_rc} -eq 1 ]; then
+        reboots=$((reboots+1))
+    fi
+
+    # Check for halt
+    if [ ${reboot_check_rc} -eq 1 ] && [ "${HALT_ON_REBOOT_DETECTED}" = "yes" ]; then
+        halt_reason="Halted due to detection of additional reboots"
+        log_with_pass_counter "${halt_reason}"
+        exit 1
+    fi
+
+    if [ ${rollout_check_rc} -eq 1 ] && [ "${HALT_ON_ROLLOUT}" = "yes" ]; then
+        halt_reason="Halt requested due to rollout detection"
+        log_with_pass_counter "${halt_reason}"
+        exit 1
+    fi
+
+    # Upgrade completed, without being halted. Continue with rollback to move to next loop
+    #
     log_with_pass_counter "Triggering rollback"
     kickRollback
     if [ $? -ne 0 ]; then
@@ -496,11 +546,11 @@ while :; do
     fi
 
     upgrades_completed=${counter}
-    completed_with_rollouts=${rollouts}
 
     log_with_pass_counter "Waiting to start next loop"
     log_with_pass_counter "SRIOV workaround was needed ${workarounds} loop(s) so far"
     log_with_pass_counter "Static pod rollouts occurred during ${rollouts} loop(s) so far"
+    log_with_pass_counter "Additional reboots detected during ${reboots} loop(s) so far"
 
     if [ ${MAX_LOOPS} -gt 0 ] && [ ${counter} -eq ${MAX_LOOPS} ]; then
         halt_reason="Maximum loops reached (${MAX_LOOPS})"
