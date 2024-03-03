@@ -10,13 +10,26 @@ Options:
     -n|--node    <node>         Specify SNO hostname - nu default, uses "oc get node" info
     -r|--rollout                Halt if a rollout is detected
     -m|--max-loops <integer>    Maximum number of upgrade loops to run
+    --hours <integer>           Halt once completed loop has exceeded overall time specified
 EOF
     exit 1
 }
 
 function duration {
     local total=$1
-    echo "$((total/60)):$((total%60))"
+    local hours=
+    local mins=
+    local secs=
+
+    hours=$((total/3600))
+    mins=$((total/60%60))
+    secs=$((total%60))
+
+    if [ "${hours}" -ne 0 ]; then
+        printf "%d:%02d:%02d" "${hours}" "${mins}" "${secs}"
+    else
+        printf "%d:%02d" "${mins}" "${secs}"
+    fi
 }
 
 function display_summary {
@@ -361,8 +374,11 @@ declare SSH_CMD=
 declare SEEDIMG=
 declare SEED_REVISIONS=
 declare -i MAX_LOOPS=-1
+declare -i FINISH_AFTER_SECONDS=0
+declare -i FINISH_AFTER_HOURS_LIMIT=0
+declare -i START_SECONDS=${SECONDS}
 
-LONGOPTS="help,ssh-key:,node:,rollout,max-loops:,ignore-reboots"
+LONGOPTS="help,ssh-key:,node:,rollout,max-loops:,ignore-reboots,hours:"
 OPTS=$(getopt -o "hk:n:rm:i" --long "${LONGOPTS}" --name "$0" -- "$@")
 
 if [ $? -ne 0 ]; then
@@ -392,6 +408,16 @@ while :; do
             ;;
         -m|--max-loops)
             MAX_LOOPS=$2
+            shift 2
+            ;;
+        --hours)
+            FINISH_AFTER_HOURS_LIMIT=$2
+            if [ ${FINISH_AFTER_HOURS_LIMIT} -le 0 ]; then
+                echo "--hours must be positive integer" >&2
+                exit 1
+            fi
+
+            FINISH_AFTER_SECONDS=$((FINISH_AFTER_HOURS_LIMIT*3600+START_SECONDS))
             shift 2
             ;;
         --)
@@ -554,6 +580,12 @@ while :; do
 
     if [ ${MAX_LOOPS} -gt 0 ] && [ ${counter} -eq ${MAX_LOOPS} ]; then
         halt_reason="Maximum loops reached (${MAX_LOOPS})"
+        exit 0
+    fi
+
+    if [ ${FINISH_AFTER_SECONDS} -gt 0 ] && [ ${FINISH_AFTER_SECONDS} -le ${SECONDS} ]; then
+        total_duration=$(duration $((SECONDS-START_SECONDS)))
+        halt_reason="Halting after ${total_duration} total, after requested ${FINISH_AFTER_HOURS_LIMIT} hour(s) limit"
         exit 0
     fi
 
