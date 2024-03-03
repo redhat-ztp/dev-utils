@@ -9,6 +9,7 @@ Options:
     -k|--ssh-key <ssh-key>      Specify ssh key to use for ssh to SNO
     -n|--node    <node>         Specify SNO hostname - nu default, uses "oc get node" info
     -r|--rollout                Halt if a rollout is detected
+    -m|--max-loops <integer>    Maximum number of upgrade loops to run
 EOF
     exit 1
 }
@@ -19,7 +20,10 @@ function duration {
 }
 
 function display_summary {
-    if [ ${upgrades_completed} -eq 0 ]; then
+    if [ ${upgrades_completed:-0} -eq 0 ]; then
+        if [ -n "${halt_reason}" ]; then
+            echo "Execution halted due to: ${halt_reason}"
+        fi
         echo "Exiting with no completed upgrades"
         return
     fi
@@ -59,6 +63,10 @@ Reboot times, from Upgrade trigger to cluster init:
     Average: ${just_reboot_average}
 
 EOF
+
+    if [ -n "${halt_reason}" ]; then
+        echo "Execution halted due to: ${halt_reason}"
+    fi
 }
 
 trap display_summary EXIT
@@ -278,11 +286,12 @@ function waitForUpgradeFinish {
 #
 function waitForRollbackFinish {
     local json=
+    local reason=
     while :; do
         sleep 10
         json=$(oc get ibu upgrade -o json 2>/dev/null)
-        upgreason=$(getCondition RollbackCompleted reason)
-        if [ "${upgreason}" = "Completed" ]; then
+        reason=$(getCondition RollbackCompleted reason)
+        if [ "${reason}" = "Completed" ]; then
             return 0
         fi
     done
@@ -293,12 +302,16 @@ function waitForRollbackFinish {
 #
 function waitForIdleFinish {
     local json=
+    local reason=
     while :; do
         sleep 10
         json=$(oc get ibu upgrade -o json 2>/dev/null)
-        upgreason=$(getCondition Idle reason)
-        if [ "${upgreason}" = "Idle" ]; then
+        reason=$(getCondition Idle reason)
+        if [ "${reason}" = "Idle" ]; then
             return 0
+        elif [ "${reason}" = "FinalizeFailed" ] || [ "${reason}" = "AbortFailed" ]; then
+            log_with_pass_counter "Transition to Idle failed"
+            return 1
         fi
     done
 }
@@ -320,9 +333,10 @@ declare HALT_ON_ROLLOUT=no
 declare SSH_CMD=
 declare SEEDIMG=
 declare SEED_REVISIONS=
+declare -i MAX_LOOPS=-1
 
-LONGOPTS="help,ssh-key:,node:,rollout"
-OPTS=$(getopt -o "hk:n:r" --long "${LONGOPTS}" --name "$0" -- "$@")
+LONGOPTS="help,ssh-key:,node:,rollout,max-loops:"
+OPTS=$(getopt -o "hk:n:rm:" --long "${LONGOPTS}" --name "$0" -- "$@")
 
 if [ $? -ne 0 ]; then
     usage
@@ -345,6 +359,10 @@ while :; do
             HALT_ON_ROLLOUT=yes
             shift
             ;;
+        -m|--max-loops)
+            MAX_LOOPS=$2
+            shift 2
+            ;;
         --)
             shift
             break
@@ -354,6 +372,15 @@ while :; do
             ;;
     esac
 done
+
+if [ ${MAX_LOOPS} -eq 0 ]; then
+    usage
+fi
+
+if [ -z "${KUBECONFIG}" ]; then
+    echo "KUBECONFIG not set" >&2
+    exit 1
+fi
 
 if [ -z "${SSH_HOST}" ]; then
     SSH_HOST=$(oc get node -o json | jq -r 'first(.items[] | .status.addresses[] | select(.type == "Hostname") | .address)')
@@ -390,6 +417,8 @@ declare -i reboot_duration_low=999999999999
 declare -i reboot_duration_high=0
 declare -i reboot_duration_total=0
 
+declare halt_reason=
+
 # Collect the seed info to get the expected static pod revisions
 getSeedInfo
 
@@ -401,15 +430,17 @@ while :; do
     log_with_pass_counter "Triggering upgrade"
     kickUpgrade
     if [ $? -ne 0 ]; then
-        log_with_pass_counter "Failed."
+        halt_reason="Failed to trigger upgrade"
+        log_with_pass_counter "${halt_reason}"
         exit 1
     fi
 
     log_with_pass_counter "Waiting for upgrade to finish"
     waitForUpgradeFinish
     if [ $? -ne 0 ]; then
-        log_with_pass_counter "Upgrade failed"
-        exit 0
+        halt_reason="Upgrade failed"
+        log_with_pass_counter "${halt_reason}"
+        exit 1
     fi
 
     log_with_pass_counter "Upgrade successful. Checking for SRIOV workaround"
@@ -426,7 +457,8 @@ while :; do
     if [ $? -eq 1 ]; then
         rollouts=$((rollouts+1))
         if [ "${HALT_ON_ROLLOUT}" = "yes" ]; then
-            log_with_pass_counter "Halting due to rollout detection."
+            halt_reason="Halt requested due to rollout detection"
+            log_with_pass_counter "${halt_reason}"
             exit 1
         fi
     fi
@@ -434,28 +466,32 @@ while :; do
     log_with_pass_counter "Triggering rollback"
     kickRollback
     if [ $? -ne 0 ]; then
-        log_with_pass_counter "Failed."
+        halt_reason="Failed to trigger rollback"
+        log_with_pass_counter "${halt_reason}"
         exit 1
     fi
 
     log_with_pass_counter "Waiting for rollback to finish"
     waitForRollbackFinish
     if [ $? -ne 0 ]; then
-        log_with_pass_counter "Failed."
+        halt_reason="Rollback failed"
+        log_with_pass_counter "${halt_reason}"
         exit 1
     fi
 
     log_with_pass_counter "Rollback successful. Triggering cleanup"
     kickIdle
     if [ $? -ne 0 ]; then
-        log_with_pass_counter "Failed."
+        halt_reason="Failed to trigger transition to Idle"
+        log_with_pass_counter "${halt_reason}"
         exit 1
     fi
 
     log_with_pass_counter "Waiting for finalize to finish"
     waitForIdleFinish
     if [ $? -ne 0 ]; then
-        log_with_pass_counter "Failed."
+        halt_reason="Finalize failed"
+        log_with_pass_counter "${halt_reason}"
         exit 1
     fi
 
@@ -465,6 +501,12 @@ while :; do
     log_with_pass_counter "Waiting to start next loop"
     log_with_pass_counter "SRIOV workaround was needed ${workarounds} loop(s) so far"
     log_with_pass_counter "Static pod rollouts occurred during ${rollouts} loop(s) so far"
+
+    if [ ${MAX_LOOPS} -gt 0 ] && [ ${counter} -eq ${MAX_LOOPS} ]; then
+        halt_reason="Maximum loops reached (${MAX_LOOPS})"
+        exit 0
+    fi
+
     sleep 10
 done
 
