@@ -90,20 +90,24 @@ function log_with_pass_counter {
     echo "### $(date): Pass ${counter}: $*"
 }
 
+function log_without_pass_counter {
+    echo "### $(date): $*"
+}
+
 #
 # SSH to the SNO to pull the seed image and collect information
 #
 function getSeedInfo {
     local imgmnt
 
-    echo "### $(date): Getting seed information"
+    log_without_pass_counter "Getting seed information"
     SEEDIMG=$(oc get ibu upgrade -o jsonpath='{.spec.seedImageRef.image}')
     if [ -z "${SEEDIMG}" ]; then
         echo "Failed to get seed image ref" >&2
         exit 1
     fi
 
-    echo "### $(date): Pulling seed image"
+    log_without_pass_counter "Pulling seed image"
     ${SSH_CMD} "sudo podman pull ${SEEDIMG}"
     if [ $? -ne 0 ]; then
         echo "Failed to pull image" >&2
@@ -125,7 +129,7 @@ function getSeedInfo {
 
     ${SSH_CMD} "sudo podman image unmount ${SEEDIMG}"
     ${SSH_CMD} "sudo podman rmi ${SEEDIMG}"
-    echo "### $(date): Seed info collected"
+    log_without_pass_counter "Seed info collected"
     echo "${SEED_REVISIONS}" | jq
 }
 
@@ -364,6 +368,85 @@ function checkForReboots {
 }
 
 #
+# System health check
+#
+function healthCheck {
+    # Check CSRs
+    oc get csr --no-headers | grep -q Pending
+    if [ $? -eq 0 ]; then
+        log_without_pass_counter "Health check: Pending CSRs are present"
+        return 1
+    fi
+
+    # Check cluster operators
+    local coAvailable=
+    local coUnavailable=
+    local co=
+
+    coAvailable=$(oc get co -o json | jq -r '
+        .items[]
+        | select(.status.conditions[] | select((.type == "Available" and .status == "True")))
+        | select(.status.conditions[] | select((.type == "Progressing" and .status == "False")))
+        | select(.status.conditions[] | select((.type == "Degraded" and .status == "False")))
+        | select(. != null) | .metadata.name')
+
+    coUnavailable=$(oc get co -o json | jq -r '
+        .items[]
+        | del (
+            select(.status.conditions[] | select((.type == "Available" and .status == "True")))
+            | select(.status.conditions[] | select((.type == "Progressing" and .status == "False")))
+            | select(.status.conditions[] | select((.type == "Degraded" and .status == "False")))
+        )
+        | select(. != null) | .metadata.name')
+
+    if [ -n "${coUnavailable}" ]; then
+        log_without_pass_counter "Health check: One or more cluster operators are not ready"
+        for co in ${coUnavailable}; do
+            log_without_pass_counter "Health check: - ${co}"
+        done
+        return 1
+    fi
+
+    if [ -z "${coAvailable}" ]; then
+        log_without_pass_counter "Health check: Failed to get available cluster operator list"
+        return 1
+    fi
+
+    # Check MCP
+    local mcp=
+    mcp=$(oc get mcp -o json | jq -r '
+        .items[]
+        | select(.status.conditions[] | select((.type == "Updated" and .status == "True")))
+        | select(.status.conditions[] | select((.type == "Updating" and .status == "False")))
+        | select(.status.conditions[] | select((.type == "Degraded" and .status == "False")))
+        | .metadata.name' | sort | xargs echo)
+
+    if [ "${mcp}" != "master worker" ]; then
+        log_without_pass_counter "Health check: MCPs not ready"
+        return 1
+    fi
+
+    return 0
+}
+
+#
+# Run health checks until satisfied
+#
+function waitForSystemHealth {
+    while :; do
+        log_without_pass_counter "Checking system health"
+
+        if healthCheck; then
+            log_without_pass_counter "System is healthy"
+            return 0
+        fi
+
+        log_without_pass_counter "Health check failed. Waiting 30 seconds before retrying"
+        sleep 30
+    done
+}
+
+#
 # Process cmdline arguments
 #
 declare SSH_KEY_ARG=
@@ -483,6 +566,9 @@ getSeedInfo
 # Run IBU upgrades in a loop, until an upgrade fails
 #
 while :; do
+    # Wait for system health checks to pass before starting upgrade
+    waitForSystemHealth
+
     counter=$((counter+1))
     log_with_pass_counter "Triggering upgrade"
     kickUpgrade
