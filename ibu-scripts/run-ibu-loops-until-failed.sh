@@ -79,6 +79,11 @@ Reboot times, from Upgrade trigger to cluster init:
 
 EOF
 
+    if [ ${reboots} -gt 0 ]; then
+        echo "NOTE: Timing results have been skewed by the presence of additional reboots in ${counter} loop(s)"
+        echo
+    fi
+
     if [ -n "${halt_reason}" ]; then
         echo "Execution halted due to: ${halt_reason}"
     fi
