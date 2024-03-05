@@ -41,18 +41,6 @@ function display_summary {
         return
     fi
 
-    w_reboot_high=$(duration $upgrade_duration_high)
-    w_reboot_low=$(duration $upgrade_duration_low)
-    w_reboot_average=$(duration $((upgrade_duration_total/upgrades_completed)))
-
-    wo_reboot_high=$(duration $upgrade_duration_since_init_high)
-    wo_reboot_low=$(duration $upgrade_duration_since_init_low)
-    wo_reboot_average=$(duration $((upgrade_duration_since_init_total/upgrades_completed)))
-
-    just_reboot_high=$(duration $reboot_duration_high)
-    just_reboot_low=$(duration $reboot_duration_low)
-    just_reboot_average=$(duration $((reboot_duration_total/upgrades_completed)))
-
     cat <<EOF
 #########################################################
 Summary:
@@ -61,6 +49,23 @@ Upgrades completed: ${upgrades_completed}
 
 Upgrades with static pod revision rollouts: ${rollouts} in ${counter} loop(s)
 Upgrades with additional reboots detected:  ${reboots} in ${counter} loop(s)
+
+EOF
+    if [ $upgrades_completed_wo_reboots -gt 0 ]; then
+        w_reboot_high=$(duration ${upgrade_duration_high})
+        w_reboot_low=$(duration ${upgrade_duration_low})
+        w_reboot_average=$(duration $((upgrade_duration_total/upgrades_completed_wo_reboots)))
+
+        wo_reboot_high=$(duration ${upgrade_duration_since_init_high})
+        wo_reboot_low=$(duration ${upgrade_duration_since_init_low})
+        wo_reboot_average=$(duration $((upgrade_duration_since_init_total/upgrades_completed_wo_reboots)))
+
+        just_reboot_high=$(duration ${reboot_duration_high})
+        just_reboot_low=$(duration ${reboot_duration_low})
+        just_reboot_average=$(duration $((reboot_duration_total/upgrades_completed_wo_reboots)))
+
+        cat <<EOF
+Timing information, excluding loops where additional reboots were detected:
 
 Upgrade stage completion times, including reboot:
     High:    ${w_reboot_high}
@@ -78,10 +83,6 @@ Reboot times, from Upgrade trigger to cluster init:
     Average: ${just_reboot_average}
 
 EOF
-
-    if [ ${reboots} -gt 0 ]; then
-        echo "NOTE: Timing results have been skewed by the presence of additional reboots in ${counter} loop(s)"
-        echo
     fi
 
     if [ -n "${halt_reason}" ]; then
@@ -211,7 +212,8 @@ function getClusterRevisions {
 function getCondition {
     local ctype="$1"
     local field="$2"
-    echo "${json}" | jq -r --arg ctype "${ctype}" --arg field "${field}" '.status.conditions[] | select(.type==$ctype)[$field]'
+
+    oc get ibu upgrade -o json 2>/dev/null | jq -r --arg ctype "${ctype}" --arg field "${field}" '.status.conditions[] | select(.type==$ctype)[$field]'
 }
 
 #
@@ -249,10 +251,8 @@ function kickIdle {
 # Wait for the IBU to report that the upgrade has either completed successfully or failed
 #
 function waitForUpgradeFinish {
-    local json=
     while :; do
         sleep 10
-        json=$(oc get ibu upgrade -o json 2>/dev/null)
         upgreason=$(getCondition UpgradeCompleted reason)
         if [ "${upgreason}" = "Failed" ]; then
             return 1
@@ -260,6 +260,13 @@ function waitForUpgradeFinish {
             break
         fi
     done
+}
+
+#
+# Collect timestamps after the upgrade completed. If reboots were detected, skip updating the watermarks
+#
+function collectTimestamps {
+    local reboots_detected=$1
 
     # Collect timestamps
     cluster_init_timestamp=$(init_timestamp)
@@ -267,6 +274,15 @@ function waitForUpgradeFinish {
     upgrade_duration=$((upgrade_completed_timestamp-upgrade_triggered_timestamp))
     upgrade_duration_since_init=$((upgrade_completed_timestamp-cluster_init_timestamp))
     reboot_duration=$((cluster_init_timestamp-upgrade_triggered_timestamp))
+
+    log_with_pass_counter "Duration: $(duration ${upgrade_duration})"
+    log_with_pass_counter "Duration: $(duration ${upgrade_duration_since_init}) (from cluster init)"
+    log_with_pass_counter "Reboot:   $(duration ${reboot_duration})"
+
+    if [ ${reboots_detected} -ne 0 ]; then
+        # Return before updating watermarks
+        return
+    fi
 
     # Totals
     upgrade_duration_total=$((upgrade_duration_total+upgrade_duration))
@@ -298,22 +314,16 @@ function waitForUpgradeFinish {
         reboot_duration_high=${reboot_duration}
     fi
 
-    log_with_pass_counter "Duration: $(duration upgrade_duration)"
-    log_with_pass_counter "Duration: $(duration upgrade_duration_since_init) (from cluster init)"
-    log_with_pass_counter "Reboot:   $(duration reboot_duration)"
-
-    return 0
+    upgrades_completed_wo_reboots=$((upgrades_completed_wo_reboots+1))
 }
 
 #
 # Wait for the rollback to complete
 #
 function waitForRollbackFinish {
-    local json=
     local reason=
     while :; do
         sleep 10
-        json=$(oc get ibu upgrade -o json 2>/dev/null)
         reason=$(getCondition RollbackCompleted reason)
         if [ "${reason}" = "Completed" ]; then
             return 0
@@ -325,11 +335,9 @@ function waitForRollbackFinish {
 # Wait for the transition back to idle to complete
 #
 function waitForIdleFinish {
-    local json=
     local reason=
     while :; do
         sleep 10
-        json=$(oc get ibu upgrade -o json 2>/dev/null)
         reason=$(getCondition Idle reason)
         if [ "${reason}" = "Idle" ]; then
             return 0
@@ -545,6 +553,7 @@ declare -i workarounds=0
 declare -i rollouts=0
 declare -i reboots=0
 declare -i upgrades_completed=0
+declare -i upgrades_completed_wo_reboots=0
 
 declare -i upgrade_triggered_timestamp=0
 declare -i cluster_init_timestamp=0
@@ -614,6 +623,8 @@ while :; do
     if [ ${reboot_check_rc} -eq 1 ]; then
         reboots=$((reboots+1))
     fi
+
+    collectTimestamps ${reboot_check_rc}
 
     # Check for halt
     if [ ${reboot_check_rc} -eq 1 ] && [ "${HALT_ON_REBOOT_DETECTED}" = "yes" ]; then
