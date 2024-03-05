@@ -87,7 +87,11 @@ EOF
 
     if [ -n "${halt_reason}" ]; then
         echo "Execution halted due to: ${halt_reason}"
+        echo
     fi
+
+    echo "Total execution duration: $(duration $((SECONDS-START_SECONDS)))"
+    echo
 }
 
 trap display_summary EXIT
