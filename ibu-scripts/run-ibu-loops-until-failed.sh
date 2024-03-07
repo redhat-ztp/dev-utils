@@ -126,6 +126,14 @@ function duration {
     fi
 }
 
+function printWaterMarks {
+    local high="$1"
+    local low="$2"
+    local average="$3"
+
+    printf "    %s: %7s  |  %s: %7s  |  %s: %7s\n" "High" "${high}" "Low" "${low}" "Average" "${average}"
+}
+
 function display_summary {
     if [ ${upgrades_completed:-0} -eq 0 ]; then
         if [ -n "${halt_reason}" ]; then
@@ -144,7 +152,7 @@ Starting cluster info:
     LCA Image:    ${CLUSTER_LCA_IMAGE}
 
 Seed info:
-    Image Name:   ${SEEDMG}
+    Image Name:   ${SEEDIMG}
     Version:      ${SEED_VERSION}
     LCA Image:    ${SEED_LCA_IMAGE}
     Recert Image: ${SEED_RECERT}
@@ -164,27 +172,49 @@ EOF
         wo_reboot_low=$(duration ${upgrade_duration_since_init_low})
         wo_reboot_average=$(duration $((upgrade_duration_since_init_total/upgrades_completed_wo_reboots)))
 
-        just_reboot_high=$(duration ${reboot_duration_high})
-        just_reboot_low=$(duration ${reboot_duration_low})
-        just_reboot_average=$(duration $((reboot_duration_total/upgrades_completed_wo_reboots)))
+        just_reboot_high=$(duration ${upgrade_reboot_duration_high})
+        just_reboot_low=$(duration ${upgrade_reboot_duration_low})
+        just_reboot_average=$(duration $((upgrade_reboot_duration_total/upgrades_completed_wo_reboots)))
 
         cat <<EOF
-Timing information, excluding loops where additional reboots were detected:
+Upgrade timing information, excluding loops where additional reboots were detected:
 
-Upgrade stage completion times, including reboot:
-    High:    ${w_reboot_high}
-    Low:     ${w_reboot_low}
-    Average: ${w_reboot_average}
+- Upgrade stage completion times, including reboot:
+$(printWaterMarks "${w_reboot_high}" "${w_reboot_low}" "${w_reboot_average}")
 
-Upgrade stage completion times, from cluster init:
-    High:    ${wo_reboot_high}
-    Low:     ${wo_reboot_low}
-    Average: ${wo_reboot_average}
+- Upgrade stage completion times, from cluster init:
+$(printWaterMarks "${wo_reboot_high}" "${wo_reboot_low}" "${wo_reboot_average}")
 
-Reboot times, from Upgrade trigger to cluster init:
-    High:    ${just_reboot_high}
-    Low:     ${just_reboot_low}
-    Average: ${just_reboot_average}
+- Reboot times, from Upgrade trigger to cluster init:
+$(printWaterMarks "${just_reboot_high}" "${just_reboot_low}" "${just_reboot_average}")
+
+EOF
+    fi
+
+    if [ $rollbacks_completed -gt 0 ]; then
+        w_reboot_high=$(duration ${rollback_duration_high})
+        w_reboot_low=$(duration ${rollback_duration_low})
+        w_reboot_average=$(duration $((rollback_duration_total/rollbacks_completed)))
+
+        wo_reboot_high=$(duration ${rollback_duration_since_init_high})
+        wo_reboot_low=$(duration ${rollback_duration_since_init_low})
+        wo_reboot_average=$(duration $((rollback_duration_since_init_total/rollbacks_completed)))
+
+        just_reboot_high=$(duration ${rollback_reboot_duration_high})
+        just_reboot_low=$(duration ${rollback_reboot_duration_low})
+        just_reboot_average=$(duration $((rollback_reboot_duration_total/rollbacks_completed)))
+
+        cat <<EOF
+Rollback timing information (including system health checks):
+
+- Rollback stage completion times, including reboot:
+$(printWaterMarks "${w_reboot_high}" "${w_reboot_low}" "${w_reboot_average}")
+
+- Rollback stage completion times, from cluster init:
+$(printWaterMarks "${wo_reboot_high}" "${wo_reboot_low}" "${wo_reboot_average}")
+
+- Reboot times, from Rollback  trigger to cluster init:
+$(printWaterMarks "${just_reboot_high}" "${just_reboot_low}" "${just_reboot_average}")
 
 EOF
     fi
@@ -273,7 +303,7 @@ function current_timestamp {
 #
 # Get the init timestamp from the cluster
 #
-function init_timestamp {
+function clusterInitTimestamp {
     local t
     for ((i=0;i<5;i++)); do
         t=$(${SSH_CMD} "stat -c %Z /proc")
@@ -288,10 +318,11 @@ function init_timestamp {
 }
 
 #
-# Get the UpgradeComplete transition time
+# Get the transition time for the specified condition
 #
-function completion_timestamp {
-    date -d "$(getCondition UpgradeCompleted lastTransitionTime)" +%s
+function conditionTransitionTimestamp {
+    local condition="$1"
+    date -d "$(getCondition ${condition} lastTransitionTime)" +%s
 }
 
 #
@@ -351,6 +382,9 @@ function kickUpgrade {
 # Patch the IBU to set stage to Rollback
 #
 function kickRollback {
+    # Get the current timestamp from the cluster
+    rollback_triggered_timestamp=$(current_timestamp)
+
     oc patch imagebasedupgrades.lca.openshift.io upgrade -p='{"spec": {"stage": "Rollback"}}' --type=merge
 }
 
@@ -376,7 +410,8 @@ function waitForUpgradeFinish {
     done
 
     local seed_lca_image=
-    seed_lca_image=$(echo "${deployment}" | jq -r '.spec.template.spec.containers[] | select(.name == "manager") | .image')
+    seed_lca_image=$(oc get -n openshift-lifecycle-agent deployments.apps lifecycle-agent-controller-manager -o json \
+        | jq -r '.spec.template.spec.containers[] | select(.name == "manager") | .image')
     if [ -n "${seed_lca_image}" ]; then
         SEED_LCA_IMAGE="${seed_lca_image}"
     else
@@ -387,19 +422,19 @@ function waitForUpgradeFinish {
 #
 # Collect timestamps after the upgrade completed. If reboots were detected, skip updating the watermarks
 #
-function collectTimestamps {
+function collectUpgradeTimestamps {
     local reboots_detected=$1
 
     # Collect timestamps
-    cluster_init_timestamp=$(init_timestamp)
-    upgrade_completed_timestamp=$(completion_timestamp)
+    upgrade_cluster_init_timestamp=$(clusterInitTimestamp)
+    upgrade_completed_timestamp=$(conditionTransitionTimestamp UpgradeCompleted)
     upgrade_duration=$((upgrade_completed_timestamp-upgrade_triggered_timestamp))
-    upgrade_duration_since_init=$((upgrade_completed_timestamp-cluster_init_timestamp))
-    reboot_duration=$((cluster_init_timestamp-upgrade_triggered_timestamp))
+    upgrade_duration_since_init=$((upgrade_completed_timestamp-upgrade_cluster_init_timestamp))
+    upgrade_reboot_duration=$((upgrade_cluster_init_timestamp-upgrade_triggered_timestamp))
 
-    log_with_pass_counter "Duration: $(duration ${upgrade_duration})"
-    log_with_pass_counter "Duration: $(duration ${upgrade_duration_since_init}) (from cluster init)"
-    log_with_pass_counter "Reboot:   $(duration ${reboot_duration})"
+    log_with_pass_counter "Upgrade Duration: $(duration ${upgrade_duration})"
+    log_with_pass_counter "Upgrade Duration: $(duration ${upgrade_duration_since_init}) (from cluster init)"
+    log_with_pass_counter "Upgrade Reboot:   $(duration ${upgrade_reboot_duration})"
 
     if [ ${reboots_detected} -ne 0 ]; then
         # Return before updating watermarks
@@ -409,7 +444,7 @@ function collectTimestamps {
     # Totals
     upgrade_duration_total=$((upgrade_duration_total+upgrade_duration))
     upgrade_duration_since_init_total=$((upgrade_duration_since_init_total+upgrade_duration_since_init))
-    reboot_duration_total=$((reboot_duration_total+reboot_duration))
+    upgrade_reboot_duration_total=$((upgrade_reboot_duration_total+upgrade_reboot_duration))
 
     # Record watermarks
     if [ ${upgrade_duration} -lt ${upgrade_duration_low} ]; then
@@ -428,15 +463,63 @@ function collectTimestamps {
         upgrade_duration_since_init_high=${upgrade_duration_since_init}
     fi
 
-    if [ ${reboot_duration} -lt ${reboot_duration_low} ]; then
-        reboot_duration_low=${reboot_duration}
+    if [ ${upgrade_reboot_duration} -lt ${upgrade_reboot_duration_low} ]; then
+        upgrade_reboot_duration_low=${upgrade_reboot_duration}
     fi
 
-    if [ ${reboot_duration} -gt ${reboot_duration_high} ]; then
-        reboot_duration_high=${reboot_duration}
+    if [ ${upgrade_reboot_duration} -gt ${upgrade_reboot_duration_high} ]; then
+        upgrade_reboot_duration_high=${upgrade_reboot_duration}
     fi
 
     upgrades_completed_wo_reboots=$((upgrades_completed_wo_reboots+1))
+}
+
+#
+# Collect timestamps after the rollback completed.
+#
+function collectRollbackTimestamps {
+    # Collect timestamps
+    rollback_cluster_init_timestamp=$(clusterInitTimestamp)
+    rollback_completed_timestamp=$(conditionTransitionTimestamp RollbackCompleted)
+    rollback_duration=$((rollback_completed_timestamp-rollback_triggered_timestamp))
+    rollback_duration_since_init=$((rollback_completed_timestamp-rollback_cluster_init_timestamp))
+    rollback_reboot_duration=$((rollback_cluster_init_timestamp-rollback_triggered_timestamp))
+
+    log_with_pass_counter "Rollback Duration: $(duration ${rollback_duration})"
+    log_with_pass_counter "Rollback Duration: $(duration ${rollback_duration_since_init}) (from cluster init)"
+    log_with_pass_counter "Rollback Reboot:   $(duration ${rollback_reboot_duration})"
+
+    # Totals
+    rollback_duration_total=$((rollback_duration_total+rollback_duration))
+    rollback_duration_since_init_total=$((rollback_duration_since_init_total+rollback_duration_since_init))
+    rollback_reboot_duration_total=$((rollback_reboot_duration_total+rollback_reboot_duration))
+
+    # Record watermarks
+    if [ ${rollback_duration} -lt ${rollback_duration_low} ]; then
+        rollback_duration_low=${rollback_duration}
+    fi
+
+    if [ ${rollback_duration} -gt ${rollback_duration_high} ]; then
+        rollback_duration_high=${rollback_duration}
+    fi
+
+    if [ ${rollback_duration_since_init} -lt ${rollback_duration_since_init_low} ]; then
+        rollback_duration_since_init_low=${rollback_duration_since_init}
+    fi
+
+    if [ ${rollback_duration_since_init} -gt ${rollback_duration_since_init_high} ]; then
+        rollback_duration_since_init_high=${rollback_duration_since_init}
+    fi
+
+    if [ ${rollback_reboot_duration} -lt ${rollback_reboot_duration_low} ]; then
+        rollback_reboot_duration_low=${rollback_reboot_duration}
+    fi
+
+    if [ ${rollback_reboot_duration} -gt ${rollback_reboot_duration_high} ]; then
+        rollback_reboot_duration_high=${rollback_reboot_duration}
+    fi
+
+    rollbacks_completed=$((rollbacks_completed+1))
 }
 
 #
@@ -568,16 +651,14 @@ function healthCheck {
 # Run health checks until satisfied
 #
 function waitForSystemHealth {
+    log_without_pass_counter "Waiting for system stability"
     while :; do
-        log_without_pass_counter "Checking system health"
 
         if healthCheck; then
             log_without_pass_counter "System is healthy"
             return 0
         fi
-
-        log_without_pass_counter "Health check failed. Waiting 30 seconds before retrying"
-        sleep 30
+        sleep 5
     done
 }
 
@@ -683,7 +764,7 @@ declare -i upgrades_completed=0
 declare -i upgrades_completed_wo_reboots=0
 
 declare -i upgrade_triggered_timestamp=0
-declare -i cluster_init_timestamp=0
+declare -i upgrade_cluster_init_timestamp=0
 declare -i upgrade_completed_timestamp=0
 declare -i upgrade_duration=0
 declare -i upgrade_duration_low=999999999999
@@ -693,12 +774,31 @@ declare -i upgrade_duration_since_init=0
 declare -i upgrade_duration_since_init_low=999999999999
 declare -i upgrade_duration_since_init_high=0
 declare -i upgrade_duration_since_init_total=0
-declare -i reboot_duration=0
-declare -i reboot_duration_low=999999999999
-declare -i reboot_duration_high=0
-declare -i reboot_duration_total=0
+declare -i upgrade_reboot_duration=0
+declare -i upgrade_reboot_duration_low=999999999999
+declare -i upgrade_reboot_duration_high=0
+declare -i upgrade_reboot_duration_total=0
+
+declare -i rollback_triggered_timestamp=0
+declare -i rollback_cluster_init_timestamp=0
+declare -i rollback_completed_timestamp=0
+declare -i rollback_duration=0
+declare -i rollback_duration_low=999999999999
+declare -i rollback_duration_high=0
+declare -i rollback_duration_total=0
+declare -i rollback_duration_since_init=0
+declare -i rollback_duration_since_init_low=999999999999
+declare -i rollback_duration_since_init_high=0
+declare -i rollback_duration_since_init_total=0
+declare -i rollback_reboot_duration=0
+declare -i rollback_reboot_duration_low=999999999999
+declare -i rollback_reboot_duration_high=0
+declare -i rollback_reboot_duration_total=0
 
 declare halt_reason=
+
+# Wait for system health checks to pass before starting
+waitForSystemHealth
 
 # Collect the seed info to get the expected static pod revisions
 getSeedInfo
@@ -707,9 +807,6 @@ getSeedInfo
 # Run IBU upgrades in a loop, until an upgrade fails
 #
 while :; do
-    # Wait for system health checks to pass before starting upgrade
-    waitForSystemHealth
-
     counter=$((counter+1))
     log_with_pass_counter "Triggering upgrade"
     kickUpgrade
@@ -751,7 +848,7 @@ while :; do
         reboots=$((reboots+1))
     fi
 
-    collectTimestamps ${reboot_check_rc}
+    collectUpgradeTimestamps ${reboot_check_rc}
 
     # Check for halt
     if [ ${reboot_check_rc} -eq 1 ] && [ "${HALT_ON_REBOOT_DETECTED}" = "yes" ]; then
@@ -784,7 +881,14 @@ while :; do
         exit 1
     fi
 
-    log_with_pass_counter "Rollback successful. Triggering cleanup"
+    log_with_pass_counter "Rollback successful"
+
+    # Wait for system health checks to pass before continuing
+    waitForSystemHealth
+
+    collectRollbackTimestamps
+
+    log_with_pass_counter "Setting stage back to Idle"
     kickIdle
     if [ $? -ne 0 ]; then
         halt_reason="Failed to trigger transition to Idle"
