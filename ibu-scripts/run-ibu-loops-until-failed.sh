@@ -3,16 +3,110 @@
 # Utility script for running IBU over and over in a loop, until it hits an upgrade failure.
 #
 
+PROG=$(basename "$0")
+
 function usage {
     cat <<EOF >&2
+${PROG}:
+IBU test tool that loops over running upgrades, until a failure is reached, or specified limits.
+Each pass will run through Prep, Upgrade, Rollback, and back to Idle.
+
 Options:
     -k|--ssh-key <ssh-key>      Specify ssh key to use for ssh to SNO
     -n|--node    <node>         Specify SNO hostname - nu default, uses "oc get node" info
     -r|--rollout                Halt if a rollout is detected
     -m|--max-loops <integer>    Maximum number of upgrade loops to run
     --hours <integer>           Halt once completed loop has exceeded overall time specified
+    -i|--ignore-reboots         Don't halt if additional reboots were detected
+
+Examples:
+    # To run loops for (just over) 24 hours, ignoring additional reboot detection
+    ${PROG} --hours 24 --ignore-reboots
+
+    # To run loops forever until a rollout is detected, or interrupted
+    ${PROG} --rollout
+
+    # To run up to 3 loops
+    ${PROG} --max-loops 3
+
 EOF
     exit 1
+}
+
+function systemCheck {
+    log_without_pass_counter "Running initial system checks"
+
+    if [ -z "${KUBECONFIG}" ]; then
+        echo "KUBECONFIG not set" >&2
+        exit 1
+    fi
+
+    local deployment=
+    deployment=$(oc get -n openshift-lifecycle-agent deployments.apps lifecycle-agent-controller-manager -o json)
+    if [ -z "${deployment}" ]; then
+        echo "Unable to get LCA deployment info" >&2
+        exit 1
+    fi
+
+    local lcaAvailable=
+    lcaAvailable=$(echo "${deployment}" | jq -r '.status.conditions[] | select(.type == "Available") | .status')
+    if [ "${lcaAvailable}" != "True" ]; then
+        echo "LCA deployment is not available" >&2
+        exit 1
+    fi
+
+    CLUSTER_LCA_IMAGE=$(echo "${deployment}" | jq -r '.spec.template.spec.containers[] | select(.name == "manager") | .image')
+    if [ -z "${CLUSTER_LCA_IMAGE}" ]; then
+        echo "Unable to determine LCA image" >&2
+        exit 1
+    fi
+
+    local ibu=
+    ibu=$(oc get ibu upgrade -o json)
+    if [ -z "${ibu}" ]; then
+        echo "Unable to retrieve IBU CR" >&2
+        exit 1
+    fi
+
+    local ibuImage=
+    local ibuVersion=
+    local ibuStage=
+    local ibuIdleReason=
+
+    ibuImage=$(echo "${ibu}" | jq -r '.spec.seedImageRef.image')
+    if [ -z "${ibuImage}" ] || [ "${ibuImage}" = "null" ]; then
+        echo "IBU CR .spec.seedImageRef.image is not set" >&2
+        exit 1
+    fi
+
+    ibuVersion=$(echo "${ibu}" | jq -r '.spec.seedImageRef.version')
+    if [ -z "${ibuVersion}" ] || [ "${ibuVersion}" = "null" ]; then
+        echo "IBU CR .spec.seedImageRef.version is not set" >&2
+        exit 1
+    fi
+
+    ibuStage=$(echo "${ibu}" | jq -r '.spec.stage')
+    if [ "${ibuStage}" != "Idle" ]; then
+        echo "IBU CR must be in Idle stage" >&2
+        exit 1
+    fi
+
+    ibuIdleReason=$(getCondition Idle reason)
+    if [ "${ibuIdleReason}" != "Idle" ]; then
+        echo "IBU CR must be Idle" >&2
+        exit 1
+    fi
+
+    if ! healthCheck; then
+        echo "Ensure system is in healthy state" >&2
+        exit 1
+    fi
+
+    CLUSTER_VERSION=$(oc get clusterversions.config.openshift.io version -o jsonpath='{.status.desired.version}')
+    if [ -z "${CLUSTER_VERSION}" ]; then
+        echo "Unable to determine cluster version" >&2
+        exit 1
+    fi
 }
 
 function duration {
@@ -44,6 +138,16 @@ function display_summary {
     cat <<EOF
 #########################################################
 Summary:
+
+Starting cluster info:
+    Version:      ${CLUSTER_VERSION}
+    LCA Image:    ${CLUSTER_LCA_IMAGE}
+
+Seed info:
+    Image Name:   ${SEEDMG}
+    Version:      ${SEED_VERSION}
+    LCA Image:    ${SEED_LCA_IMAGE}
+    Recert Image: ${SEED_RECERT}
 
 Upgrades completed: ${upgrades_completed}
 
@@ -136,6 +240,12 @@ function getSeedInfo {
         echo "Failed to collect static pod revision info" >&2
         exit 1
     fi
+
+    local manifest=
+    manifest=$(${SSH_CMD} "sudo cat ${imgmnt}/manifest.json")
+
+    SEED_VERSION=$(echo "${manifest}" | jq -r '.seed_cluster_ocp_version')
+    SEED_RECERT=$(echo "${manifest}" | jq -r '.recert_image_pull_spec')
 
     ${SSH_CMD} "sudo podman image unmount ${SEEDIMG}"
     ${SSH_CMD} "sudo podman rmi ${SEEDIMG}"
@@ -264,6 +374,14 @@ function waitForUpgradeFinish {
             break
         fi
     done
+
+    local seed_lca_image=
+    seed_lca_image=$(echo "${deployment}" | jq -r '.spec.template.spec.containers[] | select(.name == "manager") | .image')
+    if [ -n "${seed_lca_image}" ]; then
+        SEED_LCA_IMAGE="${seed_lca_image}"
+    else
+        echo "Unable to determine running LCA image" >&2
+    fi
 }
 
 #
@@ -389,7 +507,7 @@ function checkForReboots {
 #
 function healthCheck {
     # Check CSRs
-    oc get csr --no-headers | grep -q Pending
+    oc get csr --no-headers --ignore-not-found | grep -q Pending
     if [ $? -eq 0 ]; then
         log_without_pass_counter "Health check: Pending CSRs are present"
         return 1
@@ -473,6 +591,11 @@ declare HALT_ON_REBOOT_DETECTED=yes
 declare SSH_CMD=
 declare SEEDIMG=
 declare SEED_REVISIONS=
+declare SEED_VERSION=
+declare SEED_RECERT=
+declare SEED_LCA_IMAGE=
+declare CLUSTER_VERSION=
+declare CLUSTER_LCA_IMAGE=
 declare -i MAX_LOOPS=-1
 declare -i FINISH_AFTER_SECONDS=0
 declare -i FINISH_AFTER_HOURS_LIMIT=0
@@ -534,10 +657,10 @@ if [ ${MAX_LOOPS} -eq 0 ]; then
     usage
 fi
 
-if [ -z "${KUBECONFIG}" ]; then
-    echo "KUBECONFIG not set" >&2
-    exit 1
-fi
+#
+# Check that the system is ready for running IBU
+#
+systemCheck
 
 if [ -z "${SSH_HOST}" ]; then
     SSH_HOST=$(oc get node -o json | jq -r 'first(.items[] | .status.addresses[] | select(.type == "Hostname") | .address)')
