@@ -560,6 +560,12 @@ function waitForIdleFinish {
 function checkForSriovKick {
     oc get sriovnetworknodepolicies.sriovnetwork.openshift.io -n openshift-sriov-network-operator default -o jsonpath='{.metadata.annotations}{"\n"}' 2>/dev/null \
         | grep kick-reconciler
+    if [ $? -ne 0 ]; then
+        return 0
+    fi
+
+    # SRIOV workaround was detected
+    return 1
 }
 
 #
@@ -833,7 +839,7 @@ while :; do
     log_with_pass_counter "Upgrade successful. Checking for SRIOV workaround"
     checkForSriovKick
     sriov_rc=$?
-    if [ ${sriov_rc} -eq 0 ]; then
+    if [ ${sriov_rc} -eq 1 ]; then
         log_with_pass_counter "Annotation found"
         workarounds=$((workarounds+1))
     else
