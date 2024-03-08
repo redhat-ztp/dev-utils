@@ -36,6 +36,20 @@ EOF
     exit 1
 }
 
+#
+# Log functions
+#
+function log_with_pass_counter {
+    echo "### $(date): Pass ${counter}: $*"
+}
+
+function log_without_pass_counter {
+    echo "### $(date): $*"
+}
+
+#
+# Initial system check, to ensure node is setup to run IBU loop test
+#
 function systemCheck {
     log_without_pass_counter "Running initial system checks"
 
@@ -107,6 +121,9 @@ function systemCheck {
     fi
 }
 
+#
+# Utility to convert seconds to a duration string
+#
 function duration {
     local total=$1
     local hours=
@@ -124,6 +141,9 @@ function duration {
     fi
 }
 
+#
+# Print a line with specified high, low, and average watermarks in the summary output
+#
 function printWaterMarks {
     local high="$1"
     local low="$2"
@@ -132,7 +152,10 @@ function printWaterMarks {
     printf "    %s: %7s  |  %s: %7s  |  %s: %7s\n" "High" "${high}" "Low" "${low}" "Average" "${average}"
 }
 
-function display_summary {
+#
+# Display a summary of the executed IBU loops, including collected data from the run
+#
+function displaySummary {
     if [ ${upgrades_completed:-0} -eq 0 ]; then
         if [ -n "${halt_reason}" ]; then
             echo "Execution halted due to: ${halt_reason}"
@@ -226,15 +249,10 @@ EOF
     echo
 }
 
-trap display_summary EXIT
-
-function log_with_pass_counter {
-    echo "### $(date): Pass ${counter}: $*"
-}
-
-function log_without_pass_counter {
-    echo "### $(date): $*"
-}
+#
+# Call displaySummary on exit, including interrupt
+#
+trap displaySummary EXIT
 
 #
 # SSH to the SNO to pull the seed image and collect information
@@ -284,7 +302,7 @@ function getSeedInfo {
 #
 # Get the current timestamp from the cluster
 #
-function current_timestamp {
+function currentTimestamp {
     local t
     for ((i=0;i<5;i++)); do
         t=$(${SSH_CMD} "date +%s")
@@ -371,7 +389,7 @@ function kickUpgrade {
     fi
 
     # Get the current timestamp from the cluster
-    upgrade_triggered_timestamp=$(current_timestamp)
+    upgrade_triggered_timestamp=$(currentTimestamp)
 
     oc patch imagebasedupgrades.lca.openshift.io upgrade -p='{"spec": {"stage": "Upgrade"}}' --type=merge
 }
@@ -381,7 +399,7 @@ function kickUpgrade {
 #
 function kickRollback {
     # Get the current timestamp from the cluster
-    rollback_triggered_timestamp=$(current_timestamp)
+    rollback_triggered_timestamp=$(currentTimestamp)
 
     oc patch imagebasedupgrades.lca.openshift.io upgrade -p='{"spec": {"stage": "Rollback"}}' --type=merge
 }
