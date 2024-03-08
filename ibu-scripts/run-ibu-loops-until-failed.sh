@@ -13,12 +13,14 @@ Each pass will run through Prep, Upgrade, Rollback, and back to Idle.
 
 Options:
     -k|--ssh-key <ssh-key>      Specify ssh key to use for ssh to SNO
-    -n|--node    <node>         Specify SNO hostname - nu default, uses "oc get node" info
-    -r|--rollout                Halt if a rollout is detected
-    --sriov                     Halt if SRIOV workaround is detected
+    -n|--node    <node>         Specify SNO hostname - no default, uses "oc get node" info
+
     -m|--max-loops <integer>    Maximum number of upgrade loops to run
     --hours <integer>           Halt once completed loop has exceeded overall time specified
+
     -i|--ignore-reboots         Don't halt if additional reboots were detected
+    -r|--rollout                Halt if a rollout is detected
+    --sriov                     Halt if SRIOV workaround is detected
 
 Examples:
     # To run loops for (just over) 24 hours, ignoring additional reboot detection
