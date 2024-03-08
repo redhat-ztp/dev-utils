@@ -15,6 +15,7 @@ Options:
     -k|--ssh-key <ssh-key>      Specify ssh key to use for ssh to SNO
     -n|--node    <node>         Specify SNO hostname - nu default, uses "oc get node" info
     -r|--rollout                Halt if a rollout is detected
+    --sriov                     Halt if SRIOV workaround is detected
     -m|--max-loops <integer>    Maximum number of upgrade loops to run
     --hours <integer>           Halt once completed loop has exceeded overall time specified
     -i|--ignore-reboots         Don't halt if additional reboots were detected
@@ -667,6 +668,7 @@ function waitForSystemHealth {
 #
 declare SSH_KEY_ARG=
 declare SSH_HOST=
+declare HALT_ON_SRIOV_WORKAROUND=no
 declare HALT_ON_ROLLOUT=no
 declare HALT_ON_REBOOT_DETECTED=yes
 declare SSH_CMD=
@@ -682,7 +684,7 @@ declare -i FINISH_AFTER_SECONDS=0
 declare -i FINISH_AFTER_HOURS_LIMIT=0
 declare -i START_SECONDS=${SECONDS}
 
-LONGOPTS="help,ssh-key:,node:,rollout,max-loops:,ignore-reboots,hours:"
+LONGOPTS="help,ssh-key:,node:,rollout,max-loops:,ignore-reboots,hours:,sriov"
 OPTS=$(getopt -o "hk:n:rm:i" --long "${LONGOPTS}" --name "$0" -- "$@")
 
 if [ $? -ne 0 ]; then
@@ -704,6 +706,10 @@ while :; do
             ;;
         -r|--rollout)
             HALT_ON_ROLLOUT=yes
+            shift
+            ;;
+        --sriov)
+            HALT_ON_SRIOV_WORKAROUND=yes
             shift
             ;;
         -i|--ignore-reboots)
@@ -826,7 +832,8 @@ while :; do
 
     log_with_pass_counter "Upgrade successful. Checking for SRIOV workaround"
     checkForSriovKick
-    if [ $? -eq 0 ]; then
+    sriov_rc=$?
+    if [ ${sriov_rc} -eq 0 ]; then
         log_with_pass_counter "Annotation found"
         workarounds=$((workarounds+1))
     else
@@ -851,6 +858,12 @@ while :; do
     collectUpgradeTimestamps ${reboot_check_rc}
 
     # Check for halt
+    if [ ${sriov_rc} -eq 1 ] && [ "${HALT_ON_SRIOV_WORKAROUND}" = "yes" ]; then
+        halt_reason="Halted due to detection of sriov workaround"
+        log_with_pass_counter "${halt_reason}"
+        exit 1
+    fi
+
     if [ ${reboot_check_rc} -eq 1 ] && [ "${HALT_ON_REBOOT_DETECTED}" = "yes" ]; then
         halt_reason="Halted due to detection of additional reboots"
         log_with_pass_counter "${halt_reason}"
