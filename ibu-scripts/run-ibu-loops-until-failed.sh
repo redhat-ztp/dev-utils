@@ -98,11 +98,6 @@ function systemCheck {
         exit 1
     fi
 
-    if ! healthCheck; then
-        echo "Ensure system is in healthy state" >&2
-        exit 1
-    fi
-
     CLUSTER_VERSION=$(oc get clusterversions.config.openshift.io version -o jsonpath='{.status.desired.version}')
     if [ -z "${CLUSTER_VERSION}" ]; then
         echo "Unable to determine cluster version" >&2
